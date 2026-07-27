@@ -1,0 +1,141 @@
+# ---------------------------------------------------------------------------
+# Face Recognition + Emotion Timeline - default configuration
+#
+# Every key mirrors a field in configs/config.py. Delete a key to fall back to the
+# dataclass default; unknown keys are ignored, so this file is safe to trim.
+#
+# Tuned for an RTX 3050 Laptop (6 GB) + i5 + 24 GB RAM.
+# ---------------------------------------------------------------------------
+
+paths:
+  weights_dir: models/weights
+  cache_dir: cache
+  output_dir: outputs
+  assets_dir: assets
+  cast_db: cache/cast_database.db
+  cast_pickle: cache/cast_database.pkl
+  log_dir: outputs/logs
+
+gpu:
+  device: cuda
+  device_id: 0
+  # FP16 is requested here and then validated per model against its FP32 reference;
+  # a graph that misbehaves in half precision silently stays FP32 (see models/precision.py).
+  fp16: true
+  channels_last: true
+  use_cuda_streams: true
+  pinned_memory: true
+  # torch.compile saves ~0.4 ms per batch on the normalisation kernel but costs ~20 s
+  # of compile time - worth it only for long videos or a long-lived service.
+  torch_compile: false
+  # TensorRT builds a per-shape engine on first use (minutes) and then beats CUDA EP by
+  # 20-40%. Turn on for repeated runs on the same resolution; the cache is reused.
+  use_tensorrt: false
+  trt_cache_dir: cache/trt
+  gpu_mem_limit_mb: 3072
+  cudnn_conv_algo_search: HEURISTIC
+  intra_op_threads: 4
+
+video:
+  backend: auto          # auto | pyav | opencv
+  hwaccel: true          # try NVDEC first
+  decode_threads: 4
+  queue_size: 64
+  analysis_long_side: 1280   # detection resolution cap; playback stays native
+
+sampling:
+  frame_stride: 4        # 30 fps -> 7.5 analysed fps
+  adaptive: true
+  min_stride: 1
+  max_stride: 8
+  scene_cut_enabled: true
+  scene_cut_threshold: 0.35
+  scene_cut_boost_frames: 12
+  calm_window: 30
+  stride_relax_step: 1
+
+detector:
+  model: scrfd_10g_bnkps
+  input_size: 640
+  score_threshold: 0.45
+  nms_threshold: 0.4
+  max_faces: 12
+  # The published SCRFD export is batch-1 only; the value is clamped automatically
+  # after models/batch_patch.py validates what the graph really supports.
+  batch_size: 4
+
+quality:
+  enabled: true
+  min_face_px: 48
+  min_blur_var: 22.0
+  # Roll-invariant profile gate: 1.0 frontal, ~3.0 is 40 degrees of yaw.
+  max_yaw_ratio: 3.0
+  min_det_score: 0.5
+
+tracker:
+  # match_* are maximum association costs (1 - IoU); larger is more permissive.
+  high_threshold: 0.55
+  low_threshold: 0.15
+  match_threshold: 0.8
+  match_threshold_low: 0.5
+  match_threshold_new: 0.7
+  new_track_threshold: 0.6
+  max_time_lost: 30
+  min_hits: 2
+
+recognition:
+  model: arcface_r50
+  input_size: 112
+  batch_size: 16
+  similarity_threshold: 0.38   # raise to ~0.45 for a stricter cast match
+  margin_threshold: 0.06
+  # Only registered cast members are analysed. Unrecognised people are still tracked
+  # (the tracker needs them) but never reach the emotion model, the UI or the JSON.
+  # Set false to also analyse everyone else.
+  cast_only: true
+  reid_interval: 45            # sampled frames between identity refreshes
+  vote_window: 5
+  min_votes: 3
+
+emotion:
+  model: hsemotion_enet_b0_8   # hsemotion_enet_b2_8 is more accurate, ~2x the cost
+  input_size: 224
+  batch_size: 16
+  confidence_threshold: 0.4
+  smoothing: hybrid            # majority | ema | hybrid
+  window: 7
+  min_agree: 4
+  ema_alpha: 0.45
+  switch_confidence: 0.55
+
+timeline:
+  min_event_duration: 0.3
+  merge_gap: 0.6
+  close_track_after: 1.5
+  include_unknown: false       # set true to also time-line unrecognised faces
+
+pipeline:
+  detect_queue: 16
+  track_queue: 32
+  infer_queue: 32
+  result_queue: 64
+  max_batch_latency_ms: 25.0
+
+gui:
+  window_title: Face Recognition & Emotion Timeline
+  playback_fps_cap: 60
+  # The player is a small monitor column; the expression table owns the window.
+  preview_width: 480
+  video_panel_width: 420
+  face_thumb_size: 72
+  max_face_cards: 6
+  stats_interval_ms: 500
+  overlay_boxes: true
+  show_unknown_faces: false
+  max_event_rows: 500
+
+logging:
+  level: INFO
+  to_file: true
+  profile: true
+  profile_interval_s: 2.0

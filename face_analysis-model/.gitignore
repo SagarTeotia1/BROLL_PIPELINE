@@ -1,0 +1,25 @@
+# --- model weights and derived graphs (downloaded / generated on first run) ---
+models/weights/
+cache/
+outputs/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Keep the folder placeholders that document the layout.
+!assets/README.md

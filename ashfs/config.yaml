@@ -1,0 +1,64 @@
+shot_segmentation:
+  window_size_range: [3, 15]
+  min_shot_duration_s: 0.5
+  max_shot_duration_s: 12.0     # ceiling — adapted down per video duration at runtime
+  glrt_threshold: 0.10          # floor only — adaptive threshold computed per-video from embedding distribution
+  candidate_fps: 4.0            # 4fps — finer resolution for gradual changes (was 2.0)
+  gpu_shot_threshold: 0.15      # hard cut pixel-diff threshold (was hardcoded 0.5 — bug)
+  flow_boundary_enabled: true   # detect zoom/pan/tilt as additional boundaries
+  flow_threshold: 1.5           # floor only — adaptive threshold computed per-video from flow distribution
+  flow_min_gap_frames: 5        # was 10 — allow flow boundaries closer together
+
+text_change:
+  enabled: false                # opt-in — costs ~10ms/frame on CPU
+  min_iou_change: 0.3           # IoU drop below this → text changed
+  min_region_count_change: 5    # abs change in MSER region count to confirm text change
+
+complexity:
+  variance_weight: 0.5
+  motion_weight: 0.5
+  complexity_threshold_general: 0.25   # general content
+  complexity_threshold_talking_head: 0.15  # talking head / EdTech (lower = less complex)
+  complexity_threshold_fast_cut: 0.35  # fast cut / ad content
+  content_vertical: "general"          # raw footage — less aggressive pruning than talking_head
+
+budget:
+  base_frames_per_shot: 1
+  max_frames_per_shot: 8
+  duration_bonus_interval_s: 3.0   # +1 frame per 3s of duration
+  duration_bonus_start_s: 3.0
+  max_total_frames_per_video: null  # no hard cap — content drives count
+  duration_floor_interval_s: 3.0   # guarantee coverage: 1 frame per 3s minimum (raw footage)
+  duration_floor_enabled: true
+
+dual_keyframe:
+  lambda_common: 0.7     # weight toward typicality for common frame
+  alpha_unique: 0.5      # weight toward atypicality for unique frame
+  neighborhood_k: 1      # temporal neighborhood size for volatility
+  min_spacing_frames: 3  # minimum gap between selected frames
+
+hierarchy:
+  chunk_size_shots: 5
+  expansion_threshold_chunk: 0.20   # fallback
+  expansion_threshold_scene: 0.0    # scene/seq/video always expand
+  expansion_threshold_sequence: 0.0
+  # Per-vertical chunk threshold — prune redundant, keep distinct
+  expansion_threshold_talking_head: 0.10  # moderate: prune near-identical talking-head chunks
+  expansion_threshold_fast_cut: 0.28      # high diversity content — expand most
+  expansion_threshold_general: 0.18
+
+embeddings:
+  dinov2_model: "dinov2_vitb14"   # torch.hub model name
+  dinov2_batch_size: 512          # L4 24GB: 512 safe (128 for T4/16GB, 256 for A10G)
+  dinov2_device: "cuda"           # cuda | cpu
+  siglip2_enabled: false          # stored for future retrieval use
+  siglip2_batch_size: 16
+
+fallback:
+  uniform_fps: 1.0
+  max_fallback_frames: 6
+
+dense_signals:
+  enabled: false          # opt-in — requires: pip install deepface
+  batch_size: 32
+  face_detector: "opencv" # opencv fastest for candidate-frame density

@@ -1,0 +1,38 @@
+# ---------------------------------------------------------------------------
+# Face Recognition + Emotion Timeline — runtime requirements
+# Python 3.11 / 3.12, Windows or Linux, NVIDIA GPU with CUDA 12.x
+# ---------------------------------------------------------------------------
+
+# --- Core numerics -----------------------------------------------------------
+numpy>=1.26,<2.0
+scipy>=1.11                     # linear_sum_assignment for ByteTrack association
+
+# --- Deep learning -----------------------------------------------------------
+# Install torch FIRST from the CUDA 12.1 index, it also supplies the CUDA/cuDNN
+# DLLs that onnxruntime-gpu loads on Windows:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.4
+torchvision>=0.19
+
+# IMPORTANT: onnxruntime-gpu must match the CUDA major version that torch ships.
+#   torch cu121/cu124  -> onnxruntime-gpu 1.19 .. 1.22   (CUDA 12 + cuDNN 9)
+#   torch cu128/cu130  -> onnxruntime-gpu 1.23+          (CUDA 13)
+# A mismatch loads the CPU provider silently; the engine logs an explicit error and
+# falls back, but you lose all GPU acceleration.
+onnxruntime-gpu==1.22.0         # CUDA + (optional) TensorRT execution providers
+onnx>=1.16                      # graph surgery for the FP16 conversion cache
+
+# --- Vision ------------------------------------------------------------------
+opencv-python>=4.9
+av>=12.0                        # PyAV -> NVDEC hardware decoding
+Pillow>=10.0
+
+# --- GUI ---------------------------------------------------------------------
+PySide6>=6.6
+
+# --- Telemetry / IO ----------------------------------------------------------
+nvidia-ml-py>=12.535            # NVML: real GPU utilisation + VRAM
+PyYAML>=6.0
+requests>=2.31
+tqdm>=4.66
+matplotlib>=3.8                 # timeline PNG export

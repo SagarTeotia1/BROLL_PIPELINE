@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "video-kb-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.4",
+    "asyncpg>=0.29",
+    "pgvector>=0.3",
+    "pinecone>=3.0",
+    "boto3>=1.35",
+    "modal>=0.64",
+    "faster-whisper>=1.0",
+    "opencv-python-headless>=4.10",
+    "ffmpeg-python>=0.2",
+    "torch>=2.4",
+    "numpy>=1.26",
+    "sentence-transformers>=3.0",
+    "tenacity>=8.0",
+    "tqdm>=4.66",
+    "nanoid>=2.0",
+    "neo4j>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
