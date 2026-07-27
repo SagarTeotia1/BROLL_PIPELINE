@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -144,48 +145,59 @@ def build_all_frame_contexts(
     # Build lookup by DB id (UUID) → PersonRecord
     persons_by_id: dict[str, PersonRecord] = {p.id: p for p in persons}
 
-    contexts: list[FrameContext] = []
-    for kf in sorted(keyframes, key=lambda k: k.timestamp_s):
-        snippet = get_transcript_snippet(
-            transcript_segments, kf.timestamp_s, window=10.0
-        )
-        pids, emotions = get_persons_in_frame(
-            kf.frame_index, appearances, persons_by_id
-        )
+    sorted_kfs = sorted(keyframes, key=lambda k: k.timestamp_s)
 
-        # Download PIL image from R2
+    # Pre-compute per-frame text context (fast, no I/O)
+    kf_meta: dict[str, dict] = {}
+    for kf in sorted_kfs:
+        snippet = get_transcript_snippet(transcript_segments, kf.timestamp_s, window=10.0)
+        pids, emotions = get_persons_in_frame(kf.frame_index, appearances, persons_by_id)
+        kf_meta[kf.id] = {"snippet": snippet, "pids": pids, "emotions": emotions}
+
+    # Download all keyframe PNGs from R2 in parallel (16 threads)
+    def _fetch(kf: "KeyframeRecord"):
         try:
-            pil_image = _download_frame_image(kf)
+            return kf, _download_frame_image(kf)
         except ValueError as exc:
             logger.warning("Skipping frame %s (no r2_key): %s", kf.id, exc)
-            continue
+            return kf, None
         except Exception as exc:
             logger.warning("Skipping frame %s (R2 download failed): %s", kf.id, exc)
-            continue
+            return kf, None
 
-        # Build OpenAI-compatible messages with the PIL image embedded.
-        # vLLM's LLM.chat() for Qwen2.5-VL accepts PIL Image objects directly
-        # in the content list as {"type": "image", "image": <PIL.Image>}.
+    images: dict[str, "PILImage.Image"] = {}
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for kf, img in pool.map(_fetch, sorted_kfs):
+            if img is not None:
+                images[kf.id] = img
+
+    logger.info(
+        "Downloaded %d/%d keyframe images from R2", len(images), len(sorted_kfs)
+    )
+
+    contexts: list[FrameContext] = []
+    for kf in sorted_kfs:
+        pil_image = images.get(kf.id)
+        if pil_image is None:
+            continue
+        meta = kf_meta[kf.id]
         messages = _build_messages_with_pil(
             frame_id=kf.id,
             timestamp=kf.timestamp_s,
             pil_image=pil_image,
-            person_ids=pids,
-            person_emotions=emotions,
-            transcript_snippet=snippet,
+            person_ids=meta["pids"],
+            person_emotions=meta["emotions"],
+            transcript_snippet=meta["snippet"],
             prev_scene_summary=rolling_summary,
             prev_scene_id=prev_scene_id,
         )
-
-        contexts.append(
-            FrameContext(
-                keyframe=kf,
-                messages=messages,
-                request_id=kf.id,
-                person_ids=pids,
-                image=pil_image,
-            )
-        )
+        contexts.append(FrameContext(
+            keyframe=kf,
+            messages=messages,
+            request_id=kf.id,
+            person_ids=meta["pids"],
+            image=pil_image,
+        ))
 
     return contexts
 

@@ -285,6 +285,8 @@ def _build_kg_edges_for_frame(
                     "beat_type": output.story_beat.beat_type if output.story_beat else ""})
 
     for ix in output.interactions or []:
+        if not ix.is_valid:
+            continue
         p1_db_id = node_ref_to_db_id.get(("person_pid", ix.p1))
         p2_db_id = node_ref_to_db_id.get(("person_pid", ix.p2))
         rel = _INTERACTION_RELATION.get(ix.type, "INTERACTS_WITH")
@@ -609,20 +611,17 @@ async def finalize_level3_kb(
             logger.error("bulk_insert_kg_edges failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 6: Neo4j graph — fire and don't wait (non-fatal)
+    # Step 6: Neo4j graph — awaited so container doesn't exit before write
     # ------------------------------------------------------------------
     if all_nodes:
-        async def _write_neo4j():
-            try:
-                from knowledge_base.neo4j.graph_writer import write_graph  # type: ignore[import]
-                await write_graph(video_id, all_nodes, all_edges)
-                logger.info(
-                    "Neo4j graph written: %d nodes, %d edges", len(all_nodes), len(all_edges)
-                )
-            except Exception as exc:
-                logger.error("Neo4j write failed (non-fatal): %s", exc)
-
-        asyncio.create_task(_write_neo4j())
+        try:
+            from knowledge_base.neo4j.graph_writer import write_graph  # type: ignore[import]
+            await write_graph(video_id, all_nodes, all_edges)
+            logger.info(
+                "Neo4j graph written: %d nodes, %d edges", len(all_nodes), len(all_edges)
+            )
+        except Exception as exc:
+            logger.error("Neo4j write failed (non-fatal): %s", exc)
 
     logger.info(
         "finalize_level3_kb complete for video_id=%s — "

@@ -250,10 +250,14 @@ class QwenPersonInteraction(BaseModel):
     """Directed interaction between two identified persons in the frame."""
     model_config = ConfigDict(extra="ignore")
 
-    p1: str   # initiating person pid
-    p2: str   # receiving person pid
-    type: Literal["address", "confront", "collaborate", "ignore", "observe"]
+    p1: str | None = None   # initiating person pid
+    p2: str | None = None   # receiving person pid
+    type: Literal["address", "confront", "collaborate", "ignore", "observe"] = "observe"
     notes: str = ""
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.p1 and self.p2 and self.p1 != self.p2)
 
 
 class QwenRelation(BaseModel):
