@@ -27,7 +27,7 @@ MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 def _make_sampling_params() -> "SamplingParams":
     return SamplingParams(
         temperature=0.0,  # greedy — fastest decoding, fully deterministic
-        max_tokens=2048,  # full JSON schema output ~1000-1400 tokens; 2048 gives safe headroom
+        max_tokens=1400,  # observed output ~1000-1200 tokens; 1400 gives headroom without wasted decode
         stop=None,
     )
 
