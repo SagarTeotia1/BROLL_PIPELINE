@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -246,14 +246,24 @@ class QwenPersonEntry(BaseModel):
     apparent_goal: str
 
 
+_VALID_INTERACTION_TYPES = {"address", "confront", "collaborate", "ignore", "observe"}
+
+
 class QwenPersonInteraction(BaseModel):
     """Directed interaction between two identified persons in the frame."""
     model_config = ConfigDict(extra="ignore")
 
-    p1: str | None = None   # initiating person pid
-    p2: str | None = None   # receiving person pid
-    type: Literal["address", "confront", "collaborate", "ignore", "observe"] = "observe"
+    p1: str | None = None
+    p2: str | None = None
+    type: str = "observe"
     notes: str = ""
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def coerce_type(cls, v: object) -> str:
+        if isinstance(v, str) and v in _VALID_INTERACTION_TYPES:
+            return v
+        return "observe"  # comfort, support, challenge, etc. → generic
 
     @property
     def is_valid(self) -> bool:
