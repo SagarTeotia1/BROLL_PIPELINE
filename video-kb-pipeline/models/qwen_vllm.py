@@ -90,12 +90,53 @@ class QwenVLLM:
         )
         logger.info("Qwen VL LLM engine loaded: %s", MODEL_ID)
 
+        # Triton warmup: run a dummy inference to pre-compile JIT kernels
+        # (_compute_slot_mapping_kernel, _bilinear_pos_embed_kernel) so they
+        # don't spike latency on the first real inference batch.
+        self._run_triton_warmup()
+
         # Load the local embedding model on the same GPU so kb_finalizer can
         # embed searchable facts and scene captions without any external API calls.
         from models.embed_model import LocalEmbedder
 
         LocalEmbedder.get().load()
         logger.info("QwenVLLM and LocalEmbedder both loaded")
+
+    def _run_triton_warmup(self) -> None:
+        """Submit one tiny dummy request to pre-compile all Triton JIT kernels.
+
+        Without this, _compute_slot_mapping_kernel and _bilinear_pos_embed_kernel
+        compile during the first real inference batch, causing a 30-60s latency spike.
+        Running a dummy call here moves that cost into load() where it belongs.
+        """
+        import io as _io
+        import base64 as _b64
+        import numpy as _np
+        try:
+            from PIL import Image as _PIL
+        except ImportError:
+            logger.warning("PIL not available — skipping Triton warmup")
+            return
+
+        # Tiny 64×64 blank image — minimum pixels that exercises the vision encoder
+        blank = _PIL.fromarray(_np.zeros((64, 64, 3), dtype=_np.uint8))
+        buf = _io.BytesIO()
+        blank.save(buf, format="JPEG", quality=70)
+        data_url = "data:image/jpeg;base64," + _b64.b64encode(buf.getvalue()).decode()
+
+        warmup_messages = [[
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": "Reply with one word."},
+            ]},
+        ]]
+        warmup_params = SamplingParams(temperature=0.0, max_tokens=3, stop=None)
+        logger.info("QwenVLLM: running Triton warmup inference ...")
+        try:
+            self._llm.chat(warmup_messages, sampling_params=warmup_params, use_tqdm=False)
+            logger.info("QwenVLLM: Triton warmup complete — kernels compiled and cached")
+        except Exception as exc:
+            logger.warning("QwenVLLM: Triton warmup failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------
     # Synchronous batch inference — safe to call from a thread
