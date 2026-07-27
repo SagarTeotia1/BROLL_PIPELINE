@@ -516,20 +516,47 @@ def run_level2_modal(
     from shared.utils import StepTimer  # type: ignore[import]
     l2_inner_timer = StepTimer()
 
-    try:
-        logger.info("run_level2_modal: face analysis for video_id=%s", video_id)
-        _t0 = _t.perf_counter()
-        face_result = run_face_analysis(
-            video_path, video_id, cast_db_path,
-            keyframe_timestamps=keyframe_timestamps,
-            shots=[dataclasses.asdict(s) for s in shots],
-        )
-        l2_inner_timer.record("face_analysis", _t.perf_counter() - _t0)
+    # Face (GPU bursts) and color grading (pure CPU) have zero resource conflict.
+    # Run them in parallel threads → wall clock = max(face, color) not sum.
+    import concurrent.futures as _cf
+    face_exc: BaseException | None = None
+    color_exc: BaseException | None = None
+    face_result: dict = {}
+    color_result: list = []
 
-        logger.info("run_level2_modal: color grading for video_id=%s", video_id)
-        _t0 = _t.perf_counter()
-        color_result = run_color_grading(video_path, video_id, shots)
-        l2_inner_timer.record("color_grading", _t.perf_counter() - _t0)
+    def _run_face():
+        nonlocal face_exc
+        try:
+            t0 = _t.perf_counter()
+            result = run_face_analysis(
+                video_path, video_id, cast_db_path,
+                keyframe_timestamps=keyframe_timestamps,
+                shots=[dataclasses.asdict(s) for s in shots],
+            )
+            l2_inner_timer.record("face_analysis", _t.perf_counter() - t0)
+            return result
+        except Exception as exc:
+            face_exc = exc
+            raise
+
+    def _run_color():
+        nonlocal color_exc
+        try:
+            t0 = _t.perf_counter()
+            result = run_color_grading(video_path, video_id, shots)
+            l2_inner_timer.record("color_grading", _t.perf_counter() - t0)
+            return result
+        except Exception as exc:
+            color_exc = exc
+            raise
+
+    logger.info("run_level2_modal: face + color grading in parallel for video_id=%s", video_id)
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+            _face_fut = _pool.submit(_run_face)
+            _color_fut = _pool.submit(_run_color)
+            face_result = _face_fut.result()
+            color_result = _color_fut.result()
     finally:
         if cast_db_tmp:
             # Remove both .db and .pkl sidecar — build_cast_db_from_cast_list
@@ -1153,7 +1180,7 @@ async def run_full_pipeline(
         # Each shard loads the full KB (transcript, persons, appearances) but
         # only runs Qwen inference + writes for its subset of keyframes.
         # Writes are idempotent (ON CONFLICT DO UPDATE) so shards can overlap safely.
-        N_SHARDS = 4
+        N_SHARDS = 1
         # Always read keyframes from DB — L1 may have been skipped this run
         from knowledge_base.postgres.queries import get_keyframes_for_video  # type: ignore[import]
         keyframes = await get_keyframes_for_video(pool, video_id)
