@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,35 +69,40 @@ def _run_ashfs_and_save(
         len(chunks), len(shots), len(keyframes),
     )
 
-    # Upload keyframe PNGs to R2 (pure I/O — no event loop required)
+    # Upload keyframe PNGs to R2 in parallel (8 concurrent upload threads)
     if not skip_r2 and keyframes:
         cap = cv2.VideoCapture(video_path)
-        _r2_ok = True  # set False on first permission/bucket error to skip rest
+        frame_payloads: list[tuple] = []  # (kf, png_bytes)
         for kf in keyframes:
-            if not _r2_ok:
-                break
             cap.set(cv2.CAP_PROP_POS_FRAMES, kf.frame_index)
             ret, frame = cap.read()
             if ret:
+                frame_payloads.append((kf, frame_to_png_bytes(frame)))
+        cap.release()
+
+        _r2_ok = True
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_kf = {
+                executor.submit(r2_upload_frame, png_bytes, video_id, kf.frame_index): kf
+                for kf, png_bytes in frame_payloads
+                if _r2_ok
+            }
+            for future in as_completed(future_to_kf):
+                kf = future_to_kf[future]
                 try:
-                    kf.r2_key = r2_upload_frame(
-                        frame_to_png_bytes(frame), video_id, kf.frame_index
-                    )
+                    kf.r2_key = future.result()
                 except Exception as exc:
                     exc_str = str(exc)
-                    # AccessDenied / NoSuchBucket are permanent — bail fast
-                    # rather than retrying every frame (saves minutes of sleep).
                     if any(k in exc_str for k in ("AccessDenied", "NoSuchBucket", "InvalidAccessKeyId")):
                         logger.warning(
-                            "[L1-ASHFS] R2 permission error — skipping all frame uploads. "
-                            "Fix R2 credentials or pass --skip-r2. Error: %s", exc_str
+                            "[L1-ASHFS] R2 permission error — aborting remaining uploads. "
+                            "Error: %s", exc_str
                         )
                         _r2_ok = False
                     else:
                         logger.warning(
                             "[L1-ASHFS] R2 upload failed for frame %d: %s", kf.frame_index, exc
                         )
-        cap.release()
 
     logger.info("[L1-ASHFS] R2 uploads complete for video_id=%s", video_id)
     return chunks, shots, keyframes
@@ -171,6 +177,7 @@ async def run_pipeline(
         get_persons_for_video,
         get_transcript_segments_for_video,
         get_face_appearances_for_video_sampled,
+        get_existing_frame_analyses,
     )
     from shared.types import VideoMeta, ProcessingJob, LevelStatus
 
@@ -296,15 +303,13 @@ async def run_pipeline(
         # Write L1 records to DB in the async context (safe: uses the main
         # event loop's asyncpg pool, no nested-loop or cross-loop issues).
         from knowledge_base.postgres.queries import (  # noqa: F811
-            upsert_chunk,
-            upsert_shot,
+            bulk_insert_chunks,
+            bulk_insert_shots,
             bulk_insert_keyframes,
         )
 
-        for chunk in chunks:
-            await upsert_chunk(pool, chunk)
-        for shot in shots:
-            await upsert_shot(pool, shot)
+        await bulk_insert_chunks(pool, chunks)
+        await bulk_insert_shots(pool, shots)
         await bulk_insert_keyframes(pool, keyframes)
         logger.info("[L1] DB writes complete: chunks=%d shots=%d keyframes=%d",
                     len(chunks), len(shots), len(keyframes))
@@ -429,11 +434,25 @@ async def run_pipeline(
         )
         logger.info("[L3] Built %d frame contexts", len(contexts))
 
+        # Skip frames already analysed (idempotent re-runs)
+        keyframe_ids = [ctx.keyframe.id for ctx in contexts]
+        existing = await get_existing_frame_analyses(pool, keyframe_ids)
+        if existing:
+            logger.info("[L3] Skipping %d already-analysed frames", len(existing))
+            contexts = [ctx for ctx in contexts if ctx.keyframe.id not in existing]
+
         qwen = QwenVLLM.get()
         qwen.load()
 
-        frame_results = await run_qwen_analysis(contexts, batch_size=8)
-        logger.info("[L3] Qwen analysis complete: %d results", len(frame_results))
+        frame_results = await run_qwen_analysis(contexts)
+        # Merge in existing results for full finalize
+        for kf_id, output in existing.items():
+            kf = next((ctx.keyframe for ctx in contexts if ctx.keyframe.id == kf_id), None)
+            if kf is None:
+                kf = next((kf for kf in keyframes if kf.id == kf_id), None)
+            if kf is not None:
+                frame_results.append((kf, output))
+        logger.info("[L3] Qwen analysis complete: %d results (+ %d cached)", len(frame_results), len(existing))
 
         await finalize_level3_kb(pool, video_id, frame_results, persons, shots)
 

@@ -8,8 +8,8 @@ Converts raw Qwen VL frame outputs into the full set of Level-3 KB records:
 
 Text embeddings for searchable facts and scene captions are generated locally
 via the BAAI/bge-large-en-v1.5 model (1024-dim) loaded by LocalEmbedder on the
-same GPU as Qwen. Facts and frame analysis records are always written to
-Postgres regardless of whether Pinecone embedding succeeds.
+same GPU as Qwen. Embeddings are computed before DB insert so no per-fact update
+round-trips are needed.
 """
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from knowledge_base.postgres.queries import (
     bulk_insert_kg_edges,
     bulk_insert_searchable_facts,
     bulk_upsert_kg_nodes,
-    update_searchable_fact_embedding,
 )
 from shared.types import (
     FrameAnalysisRecord,
@@ -41,18 +40,11 @@ from shared.utils import gen_id
 
 logger = logging.getLogger(__name__)
 
-_FACTS_BATCH_SIZE = 50
-_EMBED_BATCH_SIZE = 64
-
-
-def _batch(items: list, size: int):
-    """Yield successive size-length chunks from items."""
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
+_EMBED_BATCH_SIZE = 128
 
 
 # ---------------------------------------------------------------------------
-# Embedding helpers — local GPU model (BAAI/bge-large-en-v1.5, 1024-dim)
+# Embedding helper — local GPU model (BAAI/bge-large-en-v1.5, 1024-dim)
 # ---------------------------------------------------------------------------
 
 
@@ -83,45 +75,8 @@ async def _embed_texts_batched(
 
 # ---------------------------------------------------------------------------
 # KG node / edge builders — rich semantic graph
-#
-# Node types:  Frame | Scene | Person | Location | Emotion | Object | Theme
-# Edge taxonomy (relation → meaning):
-#
-#   Structural:
-#     Frame  → PART_OF_SCENE  → Scene
-#     Frame  → IN_LOCATION    → Location
-#     Scene  → FOLLOWS        → Scene     (sequential, weight=1/gap_s)
-#     Scene  → SAME_LOCATION  → Scene     (shared location_id)
-#     Scene  → EMOTIONAL_SHIFT → Scene    (mood or tension change)
-#
-#   Presence / action:
-#     Person → APPEARS_IN     → Frame     (with emotion, action props)
-#     Person → SPEAKS_IN      → Frame     (dialogue detected)
-#     Person → DRIVES_SCENE   → Scene     (dominant_person field)
-#     Person → FIRST_SEEN_IN  → Frame     (only on first occurrence)
-#
-#   Person-person interaction (from interactions[]):
-#     Person → ADDRESSES      → Person
-#     Person → CONFRONTS      → Person
-#     Person → COLLABORATES   → Person
-#     Person → OBSERVES       → Person
-#     Person → IGNORES        → Person
-#     Person → CO_OCCURS_WITH → Person   (any shared frame — weight = count)
-#
-#   Object / prop tracking:
-#     Frame  → CONTAINS_OBJECT → Object
-#     Object → HELD_BY         → Person
-#     Object → INTRODUCED_IN   → Frame   (first occurrence only)
-#
-#   Emotional:
-#     Person → EXPRESSES       → Emotion  (in frame)
-#     Scene  → HAS_MOOD        → Emotion
-#
-#   Narrative (Qwen relations[]):
-#     <subject> → <PREDICATE>  → <object>  (confidence-weighted)
 # ---------------------------------------------------------------------------
 
-# Map QwenPersonInteraction.type → KG relation name
 _INTERACTION_RELATION = {
     "address":     "ADDRESSES",
     "confront":    "CONFRONTS",
@@ -130,7 +85,6 @@ _INTERACTION_RELATION = {
     "ignore":      "IGNORES",
 }
 
-# Tension levels ordered for shift detection
 _TENSION_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
@@ -140,13 +94,6 @@ def _build_kg_nodes_for_frame(
     video_id: str,
     persons: list[PersonRecord],
 ) -> list[KGNode]:
-    """Build all KG nodes derivable from one Qwen frame output.
-
-    Returns nodes for: Frame, Scene, Location, Person (per identified person),
-    Emotion (scene mood), Object (story-relevant only).
-    ON CONFLICT (video_id, node_type, ref_id) in Postgres deduplicates
-    Scene/Location/Person/Emotion/Object across frames.
-    """
     pid_to_person: dict[str, PersonRecord] = {p.pid: p for p in persons}
     nodes: list[KGNode] = []
 
@@ -154,7 +101,6 @@ def _build_kg_nodes_for_frame(
     tension = output.emotional_tone.tension_level if output.emotional_tone else ""
     beat    = output.story_beat.beat_type         if output.story_beat     else ""
 
-    # ── Frame node ────────────────────────────────────────────────────────────
     nodes.append(KGNode(
         id=gen_id(), video_id=video_id,
         node_type="Frame", ref_id=keyframe.id,
@@ -173,7 +119,6 @@ def _build_kg_nodes_for_frame(
         embedding=None,
     ))
 
-    # ── Scene node ────────────────────────────────────────────────────────────
     if output.scene_id:
         nodes.append(KGNode(
             id=gen_id(), video_id=video_id,
@@ -190,7 +135,6 @@ def _build_kg_nodes_for_frame(
             embedding=None,
         ))
 
-    # ── Location node ─────────────────────────────────────────────────────────
     loc_id = (output.location_id or "").strip()
     if loc_id:
         nodes.append(KGNode(
@@ -198,14 +142,13 @@ def _build_kg_nodes_for_frame(
             node_type="Location", ref_id=f"loc:{loc_id}",
             label=loc_id.replace("_", " ").title(),
             properties={
-                "location_type":    output.setting.location_type    if output.setting else "",
+                "location_type":     output.setting.location_type    if output.setting else "",
                 "specific_location": output.setting.specific_location if output.setting else "",
-                "indoor_outdoor":   output.setting.indoor_outdoor   if output.setting else "",
+                "indoor_outdoor":    output.setting.indoor_outdoor   if output.setting else "",
             },
             embedding=None,
         ))
 
-    # ── Emotion node (scene mood) ─────────────────────────────────────────────
     if mood:
         nodes.append(KGNode(
             id=gen_id(), video_id=video_id,
@@ -215,7 +158,6 @@ def _build_kg_nodes_for_frame(
             embedding=None,
         ))
 
-    # ── Person nodes ──────────────────────────────────────────────────────────
     for pe in output.people or []:
         person = pid_to_person.get(pe.pid)
         if person is None:
@@ -239,7 +181,6 @@ def _build_kg_nodes_for_frame(
             },
             embedding=None,
         ))
-        # Emotion node per person
         if pe.emotion_inferred:
             nodes.append(KGNode(
                 id=gen_id(), video_id=video_id,
@@ -249,20 +190,17 @@ def _build_kg_nodes_for_frame(
                 embedding=None,
             ))
 
-    # ── Object nodes (story-relevant only) ───────────────────────────────────
     for obj in output.objects or []:
         if not obj.story_relevance:
             continue
-        obj_ref = f"obj:{obj.name.lower().strip()}"
         nodes.append(KGNode(
             id=gen_id(), video_id=video_id,
-            node_type="Object", ref_id=obj_ref,
+            node_type="Object", ref_id=f"obj:{obj.name.lower().strip()}",
             label=obj.name,
             properties={"story_relevance": obj.story_relevance},
             embedding=None,
         ))
 
-    # ── Theme nodes ───────────────────────────────────────────────────────────
     for theme in output.themes_symbols or []:
         if not theme:
             continue
@@ -282,14 +220,9 @@ def _build_kg_edges_for_frame(
     keyframe: KeyframeRecord,
     video_id: str,
     node_ref_to_db_id: dict[tuple[str, str], str],
-    object_first_seen: dict[str, str],   # obj_ref_id → frame_db_id of first occurrence
-    person_first_seen: dict[str, str],   # person_ref_id → frame_db_id of first occurrence
+    object_first_seen: dict[str, str],
+    person_first_seen: dict[str, str],
 ) -> list[KGEdge]:
-    """Build all KG edges for one frame.
-
-    Emits the full relation taxonomy — structural, presence, interaction,
-    emotional, object tracking, and narrative triples.
-    """
     edges: list[KGEdge] = []
     ts = keyframe.timestamp_s
 
@@ -309,22 +242,18 @@ def _build_kg_edges_for_frame(
                 properties=props or {},
             ))
 
-    # ── Structural ────────────────────────────────────────────────────────────
     edge(frame_db_id, scene_db_id, "PART_OF_SCENE", props={"timestamp_s": ts})
     edge(frame_db_id, loc_db_id,   "IN_LOCATION",   props={"timestamp_s": ts})
+    edge(scene_db_id, emo_db_id,   "HAS_MOOD",
+         props={"tension_level": output.emotional_tone.tension_level if output.emotional_tone else ""})
 
-    # ── Scene mood ────────────────────────────────────────────────────────────
-    edge(scene_db_id, emo_db_id, "HAS_MOOD", props={"tension_level": output.emotional_tone.tension_level if output.emotional_tone else ""})
-
-    # ── Person presence ───────────────────────────────────────────────────────
-    pid_to_person_ref: dict[str, str] = {}   # pid → person ref_id (UUID)
+    pid_to_person_ref: dict[str, str] = {}
 
     for pe in output.people or []:
         p_db_id = node_ref_to_db_id.get(("person_pid", pe.pid))
         if not p_db_id:
             continue
 
-        # Resolve person ref_id for first_seen tracking
         p_ref = next((k[1] for k in node_ref_to_db_id if k[0] == "Person" and node_ref_to_db_id[k] == p_db_id), None)
         if p_ref:
             pid_to_person_ref[pe.pid] = p_ref
@@ -335,40 +264,35 @@ def _build_kg_edges_for_frame(
         edge(p_db_id, frame_db_id, "APPEARS_IN",
              props={"emotion": pe.emotion_inferred, "emotion_source": pe.emotion_source,
                     "action": pe.action, "story_role": pe.story_role, "timestamp_s": ts})
-
         edge(p_db_id, scene_db_id, "PRESENT_IN_SCENE",
              props={"timestamp_s": ts, "action": pe.action})
 
-        # Dialogue: person speaks in frame
         if output.dialogue_subtitle and output.dominant_person == pe.pid:
             edge(p_db_id, frame_db_id, "SPEAKS_IN",
                  props={"dialogue": output.dialogue_subtitle[:200], "timestamp_s": ts})
 
-        # Person emotion node
         if pe.emotion_inferred:
             emo_p_db_id = node_ref_to_db_id.get(("Emotion", f"emotion:{pe.emotion_inferred.lower()}"))
             edge(p_db_id, emo_p_db_id, "EXPRESSES",
-                 props={"emotion_source": pe.emotion_source, "confidence": 1.0
-                        if pe.emotion_source == "visual_read" else 0.6, "timestamp_s": ts})
+                 props={"emotion_source": pe.emotion_source,
+                        "confidence": 1.0 if pe.emotion_source == "visual_read" else 0.6,
+                        "timestamp_s": ts})
 
-    # ── Dominant person drives scene ──────────────────────────────────────────
     if output.dominant_person:
         dom_db_id = node_ref_to_db_id.get(("person_pid", output.dominant_person))
         edge(dom_db_id, scene_db_id, "DRIVES_SCENE",
-             props={"timestamp_s": ts, "beat_type": output.story_beat.beat_type if output.story_beat else ""})
+             props={"timestamp_s": ts,
+                    "beat_type": output.story_beat.beat_type if output.story_beat else ""})
 
-    # ── Person-person interactions ────────────────────────────────────────────
     for ix in output.interactions or []:
         p1_db_id = node_ref_to_db_id.get(("person_pid", ix.p1))
         p2_db_id = node_ref_to_db_id.get(("person_pid", ix.p2))
         rel = _INTERACTION_RELATION.get(ix.type, "INTERACTS_WITH")
         edge(p1_db_id, p2_db_id, rel,
              props={"notes": ix.notes, "timestamp_s": ts, "frame_id": keyframe.id})
-        # Always also write the symmetric CO_OCCURS_WITH (undirected co-presence)
         edge(p1_db_id, p2_db_id, "CO_OCCURS_WITH", weight=1.0,
              props={"timestamp_s": ts})
 
-    # ── Co-occurrence edges for ALL persons in frame (no explicit interaction needed) ─
     visible_pids = [pe.pid for pe in (output.people or [])]
     for i in range(len(visible_pids)):
         for j in range(i + 1, len(visible_pids)):
@@ -377,41 +301,32 @@ def _build_kg_edges_for_frame(
             edge(pa_db_id, pb_db_id, "CO_OCCURS_WITH", weight=1.0,
                  props={"timestamp_s": ts})
 
-    # ── Object tracking ───────────────────────────────────────────────────────
     for obj in output.objects or []:
         if not obj.story_relevance:
             continue
-        obj_ref  = f"obj:{obj.name.lower().strip()}"
+        obj_ref   = f"obj:{obj.name.lower().strip()}"
         obj_db_id = node_ref_to_db_id.get(("Object", obj_ref))
         if not obj_db_id or not frame_db_id:
             continue
-
         edge(frame_db_id, obj_db_id, "CONTAINS_OBJECT",
-             props={"position": obj.position, "story_relevance": obj.story_relevance, "timestamp_s": ts})
-
-        # First occurrence tracking
+             props={"position": obj.position, "story_relevance": obj.story_relevance,
+                    "timestamp_s": ts})
         if obj_ref not in object_first_seen:
             object_first_seen[obj_ref] = frame_db_id
             edge(obj_db_id, frame_db_id, "INTRODUCED_IN", props={"timestamp_s": ts})
-
-        # Object held by person (if gaze/action implies it)
         for pe in output.people or []:
             if obj.name.lower() in (pe.action or "").lower():
                 p_db_id = node_ref_to_db_id.get(("person_pid", pe.pid))
                 edge(obj_db_id, p_db_id, "HELD_BY",
                      props={"frame_id": keyframe.id, "timestamp_s": ts})
 
-    # ── Theme nodes ───────────────────────────────────────────────────────────
     for theme in output.themes_symbols or []:
         if not theme:
             continue
         theme_db_id = node_ref_to_db_id.get(("Theme", f"theme:{theme.lower().strip()}"))
-        edge(frame_db_id, theme_db_id, "ILLUSTRATES_THEME",
-             props={"timestamp_s": ts})
-        edge(scene_db_id, theme_db_id, "THEME_PRESENT",
-             props={"timestamp_s": ts})
+        edge(frame_db_id, theme_db_id, "ILLUSTRATES_THEME", props={"timestamp_s": ts})
+        edge(scene_db_id, theme_db_id, "THEME_PRESENT",     props={"timestamp_s": ts})
 
-    # ── Narrative relation triples from Qwen ──────────────────────────────────
     for rel in output.get_relations_structured():
         subj_id = (node_ref_to_db_id.get(("person_pid", rel.subject))
                    or node_ref_to_db_id.get(("Object", f"obj:{rel.subject.lower().strip()}"))
@@ -421,8 +336,7 @@ def _build_kg_edges_for_frame(
                    or scene_db_id)
         if subj_id and obj_id and subj_id != obj_id:
             rel_name = re.sub(r"[^A-Z0-9_]", "_", rel.predicate.upper())[:64].strip("_") or "RELATES_TO"
-            edge(subj_id, obj_id,
-                 rel_name,
+            edge(subj_id, obj_id, rel_name,
                  weight=float(rel.confidence),
                  props={"subject": rel.subject, "predicate": rel.predicate,
                         "object": rel.object, "frame_id": keyframe.id, "timestamp_s": ts})
@@ -430,17 +344,11 @@ def _build_kg_edges_for_frame(
     return edges
 
 
-# ---------------------------------------------------------------------------
-# Helpers retained for compatibility
-# ---------------------------------------------------------------------------
-
-
 def _make_frame_analysis_record(
     kf: KeyframeRecord,
     output: QwenFrameOutput,
     video_id: str,
 ) -> FrameAnalysisRecord:
-    """Convert a QwenFrameOutput into a FrameAnalysisRecord for DB storage."""
     return FrameAnalysisRecord(
         id=gen_id(),
         keyframe_id=kf.id,
@@ -450,38 +358,10 @@ def _make_frame_analysis_record(
         qwen_output=output.model_dump(),
         caption=output.caption,
         beat_type=output.story_beat.beat_type if output.story_beat else None,
-        scene_mood=(
-            output.emotional_tone.scene_mood if output.emotional_tone else None
-        ),
-        tension_level=(
-            output.emotional_tone.tension_level if output.emotional_tone else None
-        ),
+        scene_mood=(output.emotional_tone.scene_mood if output.emotional_tone else None),
+        tension_level=(output.emotional_tone.tension_level if output.emotional_tone else None),
         tags=output.tags or [],
     )
-
-
-def _make_searchable_fact_records(
-    kf: KeyframeRecord,
-    output: QwenFrameOutput,
-    video_id: str,
-) -> list[SearchableFactRecord]:
-    """Create one SearchableFactRecord per fact in output.searchable_facts."""
-    records = []
-    for fact_text in output.searchable_facts:
-        if not fact_text or not fact_text.strip():
-            continue
-        records.append(
-            SearchableFactRecord(
-                id=gen_id(),
-                video_id=video_id,
-                frame_id=kf.id,
-                fact_text=fact_text.strip(),
-                timestamp_s=kf.timestamp_s,
-                embedding=None,
-                pinecone_id=None,
-            )
-        )
-    return records
 
 
 async def finalize_level3_kb(
@@ -493,26 +373,14 @@ async def finalize_level3_kb(
 ) -> None:
     """Persist all Level-3 outputs to Postgres, Pinecone, and Neo4j.
 
-    Processing order per frame:
-    1. FrameAnalysisRecord  → postgres frame_analyses
-    2. SearchableFactRecords collected for bulk insert
-    3. Scene caption collected for Pinecone
-    4. KGNode + KGEdge rows written to Postgres (structured cache for filtering)
-
-    After all frames:
-    5. Bulk insert all facts into Postgres
-    6. Embed facts + scene captions via local GPU model, upsert to Pinecone
-    7. Write knowledge graph to Neo4j (primary traversal store for Cypher queries)
-
-    Frames where QwenFrameOutput is None are silently skipped.  Each step is
-    wrapped in its own try/except — partial results are always stored.
-
-    Args:
-        pool:          Open asyncpg connection pool.
-        video_id:      Stable video identifier.
-        frame_results: List of (KeyframeRecord, QwenFrameOutput | None).
-        persons:       All PersonRecord instances for this video.
-        shots:         All ShotRecord instances (reserved for future enrichment).
+    Processing order:
+    1. Collect all analyses, facts, scene captions, KG nodes from all frames
+    2. Bulk-upsert frame analyses to Postgres
+    3. Embed facts + scene captions in parallel (single GPU pass each)
+    4. Bulk-insert searchable_facts with embeddings included (no update loop)
+    5. Upsert facts + scenes to Pinecone
+    6. Bulk-upsert KG nodes → build edges → bulk-insert KG edges
+    7. Write Neo4j graph (background, non-blocking to caller)
     """
     valid_results: list[tuple[KeyframeRecord, QwenFrameOutput]] = [
         (kf, out) for kf, out in frame_results if out is not None
@@ -532,10 +400,7 @@ async def finalize_level3_kb(
     all_facts: list[SearchableFactRecord] = []
     scene_pinecone_records: dict[str, dict] = {}
     all_nodes: list[KGNode] = []
-    all_edges: list[KGEdge] = []
     all_analyses: list[FrameAnalysisRecord] = []
-
-    # scene_id → {first_ts, location_id, mood, tension} for cross-scene edges
     scene_meta: dict[str, dict] = {}
 
     # ------------------------------------------------------------------
@@ -545,8 +410,7 @@ async def finalize_level3_kb(
 
     for kf, output in sorted_results:
         try:
-            analysis = _make_frame_analysis_record(kf, output, video_id)
-            all_analyses.append(analysis)
+            all_analyses.append(_make_frame_analysis_record(kf, output, video_id))
         except Exception as exc:
             logger.error("_make_frame_analysis_record failed for keyframe %s: %s", kf.id, exc)
 
@@ -575,7 +439,6 @@ async def finalize_level3_kb(
                 },
             }
 
-        # Track scene metadata for cross-scene edge construction
         if output.scene_id and output.scene_id not in scene_meta:
             scene_meta[output.scene_id] = {
                 "first_ts": kf.timestamp_s,
@@ -585,8 +448,7 @@ async def finalize_level3_kb(
             }
 
         try:
-            nodes = _build_kg_nodes_for_frame(output, kf, video_id, persons)
-            all_nodes.extend(nodes)
+            all_nodes.extend(_build_kg_nodes_for_frame(output, kf, video_id, persons))
         except Exception as exc:
             logger.error("_build_kg_nodes_for_frame failed for keyframe %s: %s", kf.id, exc)
 
@@ -596,12 +458,69 @@ async def finalize_level3_kb(
     if all_analyses:
         try:
             await bulk_insert_frame_analyses(pool, all_analyses)
-            logger.info("Bulk-inserted %d frame analyses for video_id=%s", len(all_analyses), video_id)
+            logger.info("Bulk-inserted %d frame analyses", len(all_analyses))
         except Exception as exc:
             logger.error("bulk_insert_frame_analyses failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 2: Bulk-upsert all KG nodes → get {(type, ref_id): db_id} map
+    # Step 2: Embed facts + scene captions in parallel, THEN insert
+    # This eliminates the per-fact update loop: embed once, insert with vectors.
+    # ------------------------------------------------------------------
+    fact_texts    = [f.fact_text for f in all_facts]
+    scene_list    = list(scene_pinecone_records.values())
+    scene_captions = [s["caption"] for s in scene_list]
+
+    logger.info(
+        "Embedding %d facts + %d scene captions in parallel", len(fact_texts), len(scene_captions)
+    )
+
+    fact_embeddings, scene_embeddings = await asyncio.gather(
+        _embed_texts_batched(fact_texts),
+        _embed_texts_batched(scene_captions),
+    )
+
+    # Attach embeddings to facts before DB insert
+    for fact, emb in zip(all_facts, fact_embeddings):
+        if emb is not None:
+            fact.embedding = emb
+
+    # ------------------------------------------------------------------
+    # Step 3: Single bulk insert — facts already carry embeddings
+    # ------------------------------------------------------------------
+    if all_facts:
+        try:
+            await bulk_insert_searchable_facts(pool, all_facts)
+            logger.info("Bulk-inserted %d searchable facts (with embeddings)", len(all_facts))
+        except Exception as exc:
+            logger.error("bulk_insert_searchable_facts failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 4: Pinecone upserts — facts + scenes
+    # ------------------------------------------------------------------
+    from knowledge_base.pinecone_kb.indexer import upsert_facts, upsert_scenes
+
+    embedded_facts = [f for f in all_facts if f.embedding is not None]
+    if embedded_facts:
+        try:
+            upserted = await asyncio.to_thread(upsert_facts, embedded_facts)
+            logger.info("Upserted %d fact vectors to Pinecone", upserted)
+        except Exception as exc:
+            logger.error("Pinecone upsert_facts failed: %s", exc)
+
+    embedded_scene_records = [
+        {**rec, "embedding": emb}
+        for rec, emb in zip(scene_list, scene_embeddings)
+        if emb is not None
+    ]
+    if embedded_scene_records:
+        try:
+            upserted = await asyncio.to_thread(upsert_scenes, embedded_scene_records)
+            logger.info("Upserted %d scene vectors to Pinecone", upserted)
+        except Exception as exc:
+            logger.error("Pinecone upsert_scenes failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Step 5: KG nodes → edges → Postgres
     # ------------------------------------------------------------------
     node_ref_to_db_id: dict[tuple[str, str], str] = {}
     if all_nodes:
@@ -611,7 +530,6 @@ async def finalize_level3_kb(
                 db_id = node_ref_to_db_id.get((node.node_type, node.ref_id))
                 if db_id:
                     node.id = db_id
-            # Populate person_pid → db_id shortcut for edge resolution
             for node in all_nodes:
                 if node.node_type == "Person":
                     pid_val = node.properties.get("pid", "")
@@ -619,11 +537,11 @@ async def finalize_level3_kb(
                         db_id = node_ref_to_db_id.get((node.node_type, node.ref_id))
                         if db_id:
                             node_ref_to_db_id[("person_pid", pid_val)] = db_id
-            logger.info("Bulk-upserted %d KG nodes for video_id=%s", len(all_nodes), video_id)
+            logger.info("Bulk-upserted %d KG nodes", len(all_nodes))
         except Exception as exc:
             logger.error("bulk_upsert_kg_nodes failed: %s", exc)
 
-    # Build per-frame edges with shared tracking dicts
+    all_edges: list[KGEdge] = []
     object_first_seen: dict[str, str] = {}
     person_first_seen: dict[str, str] = {}
 
@@ -633,18 +551,12 @@ async def finalize_level3_kb(
                 output, kf, video_id, node_ref_to_db_id,
                 object_first_seen, person_first_seen,
             )
-            if edges:
-                all_edges.extend(edges)
+            all_edges.extend(edges)
         except Exception as exc:
             logger.error("_build_kg_edges_for_frame failed for keyframe %s: %s", kf.id, exc)
 
-    # ------------------------------------------------------------------
     # Cross-scene edges: FOLLOWS, EMOTIONAL_SHIFT, SAME_LOCATION
-    # Built after per-frame edges so scene_meta is fully populated.
-    # ------------------------------------------------------------------
-    cross_scene_edges: list[KGEdge] = []
     scenes_by_time = sorted(scene_meta.items(), key=lambda x: x[1]["first_ts"])
-
     for i in range(len(scenes_by_time) - 1):
         s_id, s_info = scenes_by_time[i]
         n_id, n_info = scenes_by_time[i + 1]
@@ -654,25 +566,21 @@ async def finalize_level3_kb(
             continue
 
         gap_s = n_info["first_ts"] - s_info["first_ts"]
-
-        # Scene → FOLLOWS → Scene (weight inversely proportional to gap)
-        cross_scene_edges.append(KGEdge(
+        all_edges.append(KGEdge(
             id=gen_id(), video_id=video_id,
             source_id=s_db, target_id=n_db,
             relation="FOLLOWS",
             weight=round(1.0 / max(gap_s, 1.0), 4),
             properties={"gap_s": round(gap_s, 2),
-                        "from_ts": s_info["first_ts"],
-                        "to_ts": n_info["first_ts"]},
+                        "from_ts": s_info["first_ts"], "to_ts": n_info["first_ts"]},
         ))
 
-        # Scene → EMOTIONAL_SHIFT → Scene (when mood or tension changes)
         mood_changed = s_info["mood"] != n_info["mood"] and s_info["mood"] and n_info["mood"]
         s_t = _TENSION_ORDER.get(s_info["tension"], -1)
         n_t = _TENSION_ORDER.get(n_info["tension"], -1)
         tension_delta = n_t - s_t if s_t >= 0 and n_t >= 0 else 0
         if mood_changed or abs(tension_delta) >= 1:
-            cross_scene_edges.append(KGEdge(
+            all_edges.append(KGEdge(
                 id=gen_id(), video_id=video_id,
                 source_id=s_db, target_id=n_db,
                 relation="EMOTIONAL_SHIFT",
@@ -682,9 +590,8 @@ async def finalize_level3_kb(
                             "from_tension": s_info["tension"], "to_tension": n_info["tension"]},
             ))
 
-        # Scene → SAME_LOCATION → Scene (scenes sharing a location_id)
         if s_info["location_id"] and s_info["location_id"] == n_info["location_id"]:
-            cross_scene_edges.append(KGEdge(
+            all_edges.append(KGEdge(
                 id=gen_id(), video_id=video_id,
                 source_id=s_db, target_id=n_db,
                 relation="SAME_LOCATION",
@@ -692,125 +599,30 @@ async def finalize_level3_kb(
                 properties={"location_id": s_info["location_id"]},
             ))
 
-    all_edges.extend(cross_scene_edges)
-    logger.info("Built %d cross-scene edges (FOLLOWS/EMOTIONAL_SHIFT/SAME_LOCATION)", len(cross_scene_edges))
+    logger.info("Built %d cross-scene edges", len(scenes_by_time))
 
     if all_edges:
         try:
             await bulk_insert_kg_edges(pool, all_edges)
-            logger.info("Bulk-inserted %d KG edges for video_id=%s", len(all_edges), video_id)
+            logger.info("Bulk-inserted %d KG edges", len(all_edges))
         except Exception as exc:
             logger.error("bulk_insert_kg_edges failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 3b: Write graph to Neo4j (primary traversal store for Cypher queries)
-    # Non-fatal — Postgres kg_nodes/kg_edges remain the fallback cache.
+    # Step 6: Neo4j graph — fire and don't wait (non-fatal)
     # ------------------------------------------------------------------
     if all_nodes:
-        try:
-            from knowledge_base.neo4j.graph_writer import write_graph  # type: ignore[import]
-            await write_graph(video_id, all_nodes, all_edges)
-            logger.info(
-                "Neo4j graph written for video_id=%s: %d nodes, %d edges",
-                video_id, len(all_nodes), len(all_edges),
-            )
-        except Exception as exc:
-            logger.error("Neo4j write failed (non-fatal) for video_id=%s: %s", video_id, exc)
-
-    # ------------------------------------------------------------------
-    # Step 5: Bulk-insert all facts into Postgres
-    # ------------------------------------------------------------------
-    if all_facts:
-        for start in range(0, len(all_facts), _FACTS_BATCH_SIZE):
-            batch = all_facts[start : start + _FACTS_BATCH_SIZE]
+        async def _write_neo4j():
             try:
-                await bulk_insert_searchable_facts(pool, batch)
-            except Exception as exc:
-                logger.error(
-                    "bulk_insert_searchable_facts failed for batch [%d:%d]: %s",
-                    start,
-                    start + len(batch),
-                    exc,
-                )
-        logger.info(
-            "Inserted %d searchable facts to Postgres for video_id=%s",
-            len(all_facts),
-            video_id,
-        )
-
-    # ------------------------------------------------------------------
-    # Step 6: Embed facts + scene captions via local GPU model → Pinecone
-    # ------------------------------------------------------------------
-    from knowledge_base.pinecone_kb.indexer import upsert_facts, upsert_scenes
-
-    # Embed facts
-    fact_texts = [f.fact_text for f in all_facts]
-    logger.info("Embedding %d fact texts for video_id=%s", len(fact_texts), video_id)
-    fact_embeddings = await _embed_texts_batched(fact_texts)
-
-    embedded_facts: list[SearchableFactRecord] = []
-    for fact, emb in zip(all_facts, fact_embeddings):
-        if emb is not None:
-            fact.embedding = emb
-            embedded_facts.append(fact)
-
-    if embedded_facts:
-        try:
-            upserted = await asyncio.to_thread(upsert_facts, embedded_facts)
-            logger.info(
-                "Upserted %d fact vectors to Pinecone for video_id=%s",
-                upserted,
-                video_id,
-            )
-        except Exception as exc:
-            logger.error(
-                "Pinecone upsert_facts failed for video_id=%s: %s", video_id, exc
-            )
-
-        # Write embeddings back to Postgres so the DB record is fully populated.
-        # Each update is attempted independently — one failure does not block the rest.
-        for fact in embedded_facts:
-            if fact.embedding is None:
-                continue
-            try:
-                await update_searchable_fact_embedding(
-                    pool,
-                    fact_id=fact.id,
-                    embedding=fact.embedding,
-                    pinecone_id=fact.pinecone_id,
+                from knowledge_base.neo4j.graph_writer import write_graph  # type: ignore[import]
+                await write_graph(video_id, all_nodes, all_edges)
+                logger.info(
+                    "Neo4j graph written: %d nodes, %d edges", len(all_nodes), len(all_edges)
                 )
             except Exception as exc:
-                logger.warning(
-                    "update_searchable_fact_embedding failed for fact %s: %s",
-                    fact.id,
-                    exc,
-                )
+                logger.error("Neo4j write failed (non-fatal): %s", exc)
 
-    # Embed scene captions
-    scene_list = list(scene_pinecone_records.values())
-    scene_captions = [s["caption"] for s in scene_list]
-    logger.info(
-        "Embedding %d scene captions for video_id=%s", len(scene_captions), video_id
-    )
-    scene_embeddings = await _embed_texts_batched(scene_captions)
-
-    embedded_scene_records: list[dict] = []
-    for scene_rec, emb in zip(scene_list, scene_embeddings):
-        if emb is not None:
-            embedded_scene_records.append({**scene_rec, "embedding": emb})
-
-    if embedded_scene_records:
-        try:
-            upserted = await asyncio.to_thread(upsert_scenes, embedded_scene_records)
-            logger.info(
-                "Upserted %d scene vectors to Pinecone for video_id=%s",
-                upserted,
-                video_id,
-            )
-        except Exception as exc:
-            logger.error(
-                "Pinecone upsert_scenes failed for video_id=%s: %s", video_id, exc
-            )
+        asyncio.create_task(_write_neo4j())
 
     logger.info(
         "finalize_level3_kb complete for video_id=%s — "
