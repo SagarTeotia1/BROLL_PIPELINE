@@ -1153,7 +1153,7 @@ async def run_full_pipeline(
         # Each shard loads the full KB (transcript, persons, appearances) but
         # only runs Qwen inference + writes for its subset of keyframes.
         # Writes are idempotent (ON CONFLICT DO UPDATE) so shards can overlap safely.
-        N_SHARDS = 1
+        N_SHARDS = 4
         # Always read keyframes from DB — L1 may have been skipped this run
         from knowledge_base.postgres.queries import get_keyframes_for_video  # type: ignore[import]
         keyframes = await get_keyframes_for_video(pool, video_id)
