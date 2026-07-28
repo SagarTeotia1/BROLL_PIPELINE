@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import defaultdict
@@ -10,8 +11,8 @@ from shared.config import settings
 
 logger = logging.getLogger(__name__)
 
-_NODE_BATCH_SIZE = 100
-_EDGE_BATCH_SIZE = 100
+_NODE_BATCH_SIZE = 500
+_EDGE_BATCH_SIZE = 500
 
 
 async def ensure_constraints(database: str | None = None) -> None:
@@ -41,8 +42,9 @@ async def write_nodes(nodes: list[KGNode], database: str | None = None) -> dict[
     for node in nodes:
         nodes_by_type[node.node_type].append(node)
 
-    async with neo4j_session(database) as session:
-        for node_type, typed_nodes in nodes_by_type.items():
+    async def _write_node_type(node_type: str, typed_nodes: list[KGNode]) -> dict[tuple[str, str], str]:
+        result_map: dict[tuple[str, str], str] = {}
+        async with neo4j_session(database) as session:
             for i in range(0, len(typed_nodes), _NODE_BATCH_SIZE):
                 batch = typed_nodes[i : i + _NODE_BATCH_SIZE]
                 batch_props: list[dict] = []
@@ -57,7 +59,7 @@ async def write_nodes(nodes: list[KGNode], database: str | None = None) -> dict[
                         if isinstance(v, (str, int, float, bool)):
                             props[k] = v
                         elif isinstance(v, list) and all(isinstance(i2, str) for i2 in v):
-                            props[k] = v  # Neo4j supports list[str] properties
+                            props[k] = v
                     batch_props.append(props)
 
                 try:
@@ -71,13 +73,12 @@ async def write_nodes(nodes: list[KGNode], database: str | None = None) -> dict[
                         batch=batch_props,
                     )
                     async for record in result:
-                        node_ref_to_element_id[(node_type, record["ref_id"])] = record["element_id"]
+                        result_map[(node_type, record["ref_id"])] = record["element_id"]
                 except Exception as e:
                     logger.warning(
                         "UNWIND batch failed for %s (offset %d): %s — falling back to individual merges",
                         node_type, i, e,
                     )
-                    # Fallback: individual MERGE for each node in this batch
                     for node in batch:
                         try:
                             r = await session.run(
@@ -97,11 +98,23 @@ async def write_nodes(nodes: list[KGNode], database: str | None = None) -> dict[
                             )
                             rec = await r.single()
                             if rec:
-                                node_ref_to_element_id[(node_type, node.ref_id)] = rec["element_id"]
+                                result_map[(node_type, node.ref_id)] = rec["element_id"]
                         except Exception as e2:
                             logger.warning(
                                 "Individual node merge failed %s/%s: %s", node_type, node.ref_id, e2
                             )
+        return result_map
+
+    # Write all node types in parallel — different labels, no write conflicts
+    type_results = await asyncio.gather(
+        *[_write_node_type(nt, ns) for nt, ns in nodes_by_type.items()],
+        return_exceptions=True,
+    )
+    for res in type_results:
+        if isinstance(res, dict):
+            node_ref_to_element_id.update(res)
+        elif isinstance(res, Exception):
+            logger.warning("Node type write task failed: %s", res)
 
     logger.info(
         "write_nodes complete: %d nodes written across %d label types",
