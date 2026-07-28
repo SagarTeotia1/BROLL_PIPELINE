@@ -125,19 +125,24 @@ def _load_face_modules():
     if not already_on_path:
         sys.path.insert(0, face_model_root)
 
-    # Snapshot all ``pipeline`` and ``pipeline.*`` keys that exist in
-    # sys.modules *before* we exec the face-model worker.
-    pipeline_snapshot: dict[str, types.ModuleType | None] = {
-        k: sys.modules.get(k)
-        for k in list(sys.modules)
-        if k == "pipeline" or k.startswith("pipeline.")
-    }
+    # Snapshot ``pipeline``, ``pipeline.*``, and ``models``, ``models.*`` from
+    # sys.modules before importing face-model symbols.
+    #
+    # ``pipeline`` conflict: face_analysis-model has its own pipeline.batching
+    # which shadows our top-level pipeline package.
+    #
+    # ``models`` conflict: when Qwen loads in the same process (single-GPU mode),
+    # it caches ``models`` (pointing to /app/models/) in sys.modules.  Face
+    # analysis needs ``models.model_zoo`` from /app_modules/face_analysis/models/.
+    # Evicting the cached entry lets the face imports resolve correctly.
+    def _snapshot_and_evict(*prefixes: str) -> dict[str, types.ModuleType | None]:
+        snap: dict[str, types.ModuleType | None] = {}
+        for k in list(sys.modules):
+            if any(k == p or k.startswith(p + ".") for p in prefixes):
+                snap[k] = sys.modules.pop(k, None)
+        return snap
 
-    # Temporarily EVICT our pipeline from sys.modules so that exec_module's
-    # ``from pipeline.batching import ...`` resolves against face_model_root
-    # on sys.path instead of our own pipeline package (which has no batching).
-    for key in list(pipeline_snapshot):
-        sys.modules.pop(key, None)
+    combined_snapshot = _snapshot_and_evict("pipeline", "models")
 
     try:
         from configs.config import AppConfig  # type: ignore[import]
@@ -158,13 +163,13 @@ def _load_face_modules():
         AnalysisPipeline = worker_mod.AnalysisPipeline
         PipelineCallbacks = worker_mod.PipelineCallbacks
     finally:
-        # Remove any pipeline.* the face model registered (e.g. pipeline.batching)
+        # Remove any pipeline.* / models.* the face model registered
         for key in list(sys.modules):
-            if key == "pipeline" or key.startswith("pipeline."):
+            if any(key == p or key.startswith(p + ".") for p in ("pipeline", "models")):
                 del sys.modules[key]
 
-        # Restore our own pipeline.* entries
-        for key, original in pipeline_snapshot.items():
+        # Restore our own pipeline.* and models.* entries
+        for key, original in combined_snapshot.items():
             if original is None:
                 sys.modules.pop(key, None)
             else:
@@ -411,6 +416,49 @@ def run_face_analysis(
         )
     except Exception as _cfg_exc:
         logger.warning("Could not override recognition thresholds: %s", _cfg_exc)
+
+    # Auto-tune sampling stride and batch sizes based on video duration.
+    # Default stride=4 (7.5fps) is fine for short clips; long videos can use
+    # larger stride because ByteTrack + adaptive mode still maintain track identity.
+    # Larger ONNX batches fill A100 significantly better than the default bs=4.
+    # During L2, Qwen is idle (inference hasn't started) so ~64 GB VRAM is free
+    # for ONNX — raise the arena limit from the conservative 3 GB default.
+    try:
+        import cv2 as _cv2
+        _cap = _cv2.VideoCapture(video_path)
+        _fps_vid = _cap.get(_cv2.CAP_PROP_FPS) or 30.0
+        _total_frames_vid = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+        _cap.release()
+        _duration_s = _total_frames_vid / max(_fps_vid, 1.0)
+
+        if _duration_s > 5400:          # > 90 min: coarse stride, still safe
+            config.sampling.frame_stride = 8
+            config.sampling.max_stride   = 24
+        elif _duration_s > 1800:        # > 30 min
+            config.sampling.frame_stride = 6
+            config.sampling.max_stride   = 16
+        else:                            # < 30 min: default
+            config.sampling.frame_stride = 4
+            config.sampling.max_stride   = 8
+
+        config.detector.batch_size     = 8    # 4 → 8: doubles SCRFD throughput on A100
+        config.recognition.batch_size  = 32   # 16 → 32
+        config.emotion.batch_size      = 32   # 16 → 32
+        config.gpu.gpu_mem_limit_mb    = 8192  # 3 GB → 8 GB ONNX arena (Qwen idle during L2)
+
+        logger.info(
+            "Face pipeline auto-tuned: duration=%.0fs → stride=%d max_stride=%d "
+            "det_bs=%d rec_bs=%d emo_bs=%d ort_mem=%dMB",
+            _duration_s,
+            config.sampling.frame_stride,
+            config.sampling.max_stride,
+            config.detector.batch_size,
+            config.recognition.batch_size,
+            config.emotion.batch_size,
+            config.gpu.gpu_mem_limit_mb,
+        )
+    except Exception as _tune_exc:
+        logger.warning("Face pipeline auto-tune failed (non-fatal): %s", _tune_exc)
 
     # ------------------------------------------------------------------
     # 3. Override cast DB paths when caller supplies one.

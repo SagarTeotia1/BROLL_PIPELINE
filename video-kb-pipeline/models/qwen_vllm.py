@@ -76,9 +76,9 @@ class QwenVLLM:
             model=MODEL_ID,
             dtype="bfloat16",
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.92,
+            gpu_memory_utilization=0.80,
             max_model_len=16384,
-            max_num_seqs=16,           # L40s 48GB: model=16GB, 32GB free → 16 concurrent seqs
+            max_num_seqs=48,           # A100 80GB: model=16GB, 48GB KV cache, 16GB free for L1/L2
             enable_prefix_caching=True,
             enable_chunked_prefill=True,  # better GPU utilisation for mixed-length batches
             limit_mm_per_prompt={"image": 1},
@@ -118,8 +118,11 @@ class QwenVLLM:
             logger.warning("PIL not available — skipping Triton warmup")
             return
 
-        # Tiny 64×64 blank image — minimum pixels that exercises the vision encoder
-        blank = _PIL.fromarray(_np.zeros((64, 64, 3), dtype=_np.uint8))
+        # 800×600 image — after vision processing this hits max_pixels territory
+        # (~768 patches), pre-compiling the high-count kernel shapes that real
+        # keyframes exercise.  Using 64×64 only pre-compiles the min_pixels
+        # (256-patch) variant, leaving the first real frame to spike on compile.
+        blank = _PIL.fromarray(_np.zeros((600, 800, 3), dtype=_np.uint8))
         buf = _io.BytesIO()
         blank.save(buf, format="JPEG", quality=70)
         data_url = "data:image/jpeg;base64," + _b64.b64encode(buf.getvalue()).decode()

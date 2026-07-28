@@ -366,6 +366,25 @@ def _make_frame_analysis_record(
     )
 
 
+def _build_frame_analysis_records(
+    frame_results: list[tuple[KeyframeRecord, QwenFrameOutput | None]],
+) -> list[FrameAnalysisRecord]:
+    """Build FrameAnalysisRecord objects from frame results, skipping None outputs.
+
+    Used for per-chunk DB checkpointing during long-video Qwen inference so that
+    progress is not lost if the container is interrupted mid-run.
+    """
+    records: list[FrameAnalysisRecord] = []
+    for kf, output in frame_results:
+        if output is None:
+            continue
+        try:
+            records.append(_make_frame_analysis_record(kf, output, kf.video_id))
+        except Exception as exc:
+            logger.error("_build_frame_analysis_records: failed for keyframe %s: %s", kf.id, exc)
+    return records
+
+
 async def finalize_level3_kb(
     pool: asyncpg.Pool,
     video_id: str,

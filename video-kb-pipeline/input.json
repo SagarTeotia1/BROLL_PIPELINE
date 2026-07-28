@@ -1,28 +1,23 @@
 {
   "video": {
-    "url": "https://r2.sagarteotia.in/input%20video.mp4",
-    "filename": "input video.mp4"
+    "url": "https://r2.sagarteotia.in/Poadcast%20(1).mp4",
+    "filename": "Podcast (1).mp4"
   },
   "cast": [
     {
-      "id": "samay_raina",
-      "name": "Samay Raina",
-      "reference_image": "https://r2.sagarteotia.in/Samay_Raina/face.jpg"
+      "id": "ranveer",
+      "name": "Ranveer",
+      "reference_image": "https://r2.sagarteotia.in/RANVEER/face.jpg"
     },
     {
-      "id": "netflix_guy",
-      "name": "Netflix Guy",
-      "reference_image": "https://r2.sagarteotia.in/Netflix-Boy.png"
+      "id": "drogbaba",
+      "name": "Drogbaba",
+      "reference_image": "https://r2.sagarteotia.in/DROGBABA/face.jpg"
     },
     {
-      "id": "bodyguard",
-      "name": "BodyGaurd",
-      "reference_image": "https://r2.sagarteotia.in/BodyGaurd/face.jpg"
-    },
-    {
-      "id": "balraj",
-      "name": "Balraj",
-      "reference_image": "https://r2.sagarteotia.in/Balraj/face.jpg"
+      "id": "markon",
+      "name": "Markon",
+      "reference_image": "https://r2.sagarteotia.in/MARKON/face.jpg"
     }
   ]
 }

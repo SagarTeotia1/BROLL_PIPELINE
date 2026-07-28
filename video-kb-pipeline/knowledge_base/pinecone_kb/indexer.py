@@ -112,12 +112,12 @@ def upsert_scenes(scene_records: list[dict]) -> int:
         logger.debug("upsert_scenes: no eligible records.")
         return 0
 
+    def _trunc(s: str, limit: int = 500) -> str:
+        return s[:limit] if len(s.encode()) > limit else s
+
     total = 0
     for batch in _batch(eligible, _BATCH_SIZE):
         vectors: list[dict[str, Any]] = []
-        def _trunc(s: str, limit: int = 500) -> str:
-            return s[:limit] if len(s.encode()) > limit else s
-
         for r in batch:
             extra_meta: dict[str, Any] = {
                 k: v for k, v in (r.get("metadata", {}) or {}).items()

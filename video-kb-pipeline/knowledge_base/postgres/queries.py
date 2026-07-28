@@ -321,6 +321,8 @@ async def bulk_insert_keyframes(
     pool: asyncpg.Pool, keyframes: list[KeyframeRecord]
 ) -> None:
     """Bulk-upsert keyframes via executemany — far faster than one-by-one for 1700+ frames."""
+    if not keyframes:
+        return
     records = [
         (
             _to_uuid(kf.id),
@@ -383,6 +385,8 @@ async def bulk_insert_transcript_segments(
     pool: asyncpg.Pool, segs: list[TranscriptSegment]
 ) -> None:
     """Insert transcript segments in bulk.  Uses executemany for efficiency."""
+    if not segs:
+        return
     records = [
         (
             _to_uuid(seg.id),
@@ -485,6 +489,8 @@ async def get_persons_for_video(
 async def bulk_insert_face_appearances(
     pool: asyncpg.Pool, apps: list[FaceAppearanceRecord]
 ) -> None:
+    if not apps:
+        return
     records = [
         (
             _to_uuid(app.id),
@@ -579,6 +585,8 @@ async def get_face_appearances_for_frame(
 async def bulk_insert_face_timeline_events(
     pool: asyncpg.Pool, events: list[FaceTimelineEvent]
 ) -> None:
+    if not events:
+        return
     records = [
         (
             _to_uuid(ev.id),
@@ -633,6 +641,8 @@ async def bulk_upsert_color_grades(
     pool: asyncpg.Pool, grades: list[ColorGradeRecord]
 ) -> None:
     """Upsert all color grade records in a single executemany call."""
+    if not grades:
+        return
     records = [
         (
             _to_uuid(g.id),
@@ -702,6 +712,8 @@ async def bulk_insert_frame_analyses(
     pool: asyncpg.Pool, analyses: list[FrameAnalysisRecord]
 ) -> None:
     """Bulk-upsert frame analyses — far faster than one-by-one for 1700+ frames."""
+    if not analyses:
+        return
     records = [
         (
             _to_uuid(a.id),
@@ -791,6 +803,8 @@ async def bulk_upsert_kg_nodes(
 async def bulk_insert_searchable_facts(
     pool: asyncpg.Pool, facts: list[SearchableFactRecord]
 ) -> None:
+    if not facts:
+        return
     records = [
         (
             _to_uuid(fact.id),
@@ -909,6 +923,8 @@ async def upsert_kg_node(pool: asyncpg.Pool, node: KGNode) -> str:
 
 
 async def bulk_insert_kg_edges(pool: asyncpg.Pool, edges: list[KGEdge]) -> None:
+    if not edges:
+        return
     records = [
         (
             _to_uuid(edge.id),

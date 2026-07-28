@@ -211,7 +211,7 @@ qwen_image = (
 
 
 @app.function(
-    gpu="L40S",
+    gpu="A100",
     image=l1_image,
     timeout=3600,
     volumes=_ALL_VOLUMES,
@@ -235,7 +235,7 @@ def _warmup_l1_models() -> None:
 
 
 @app.function(
-    gpu="L40S",
+    gpu="A100",
     image=qwen_image,
     timeout=7200,
     volumes=_ALL_VOLUMES,
@@ -258,9 +258,9 @@ def _warmup_l3_models() -> None:
         model="Qwen/Qwen3-VL-8B-Instruct",
         dtype="bfloat16",
         tensor_parallel_size=1,
-        gpu_memory_utilization=0.92,
+        gpu_memory_utilization=0.80,
         max_model_len=16384,
-        max_num_seqs=16,
+        max_num_seqs=48,
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
         limit_mm_per_prompt={"image": 1},
@@ -329,7 +329,7 @@ def _download_video_in_container(video_url: str) -> str:
 
 
 @app.function(
-    gpu="L40S",
+    gpu="A100",
     image=l1_image,
     timeout=3600,
     secrets=[modal.Secret.from_name("video-kb-secrets")],
@@ -338,10 +338,10 @@ def _download_video_in_container(video_url: str) -> str:
 def run_l1_modal(video_path: str, video_id: str) -> dict:
     """Run ASHFS keyframe sampling + Whisper transcription in parallel.
 
-    One container download, one cold start, both workloads share the L40S GPU.
+    One container download, one cold start, both workloads share the A100 GPU.
     ASHFS uses PyTorch CUDA (DINOv2 ~330MB VRAM).
     Whisper uses ctranslate2 CUDA (large-v3 ~3GB VRAM).
-    Both fit comfortably on 48GB L40S.
+    Both fit comfortably on 80GB A100.
 
     Returns:
         Dict with keys:
@@ -405,7 +405,7 @@ def run_l1_modal(video_path: str, video_id: str) -> dict:
 
 
 @app.function(
-    gpu="L40S",
+    gpu="A100",
     image=face_color_image,
     timeout=7200,
     secrets=[modal.Secret.from_name("video-kb-secrets")],
@@ -594,7 +594,7 @@ def run_level2_modal(
 
 
 @app.cls(
-    gpu="L40S",
+    gpu="A100",
     image=qwen_image,
     timeout=14400,
     secrets=[modal.Secret.from_name("video-kb-secrets")],
@@ -811,7 +811,10 @@ async def run_full_pipeline(
     pool = await get_pool()
     await run_migrations(pool)
 
-    video_id = video_id or gen_id()
+    if not video_id:
+        import hashlib as _hl
+        video_id = _hl.sha256(video_path.encode()).hexdigest()[:32]
+        logger.info("run_full_pipeline: video_id derived from URL hash: %s", video_id)
     logger.info("run_full_pipeline: video_id=%s path=%s", video_id, video_path)
 
     # ------------------------------------------------------------------
@@ -910,9 +913,9 @@ async def run_full_pipeline(
         try:
             l1_timer = StepTimer()
 
-            # Single L40S container runs ASHFS + Whisper in parallel threads.
+            # Single A100 container runs ASHFS + Whisper in parallel threads.
             # Reads video from shared volume — no re-download.
-            logger.info("[L1] Dispatching ASHFS + Whisper to single L40S container")
+            logger.info("[L1] Dispatching ASHFS + Whisper to single A100 container")
             import time as _t
             _t0 = _t.perf_counter()
             l1_result = await run_l1_modal.remote.aio(staged_video_path, video_id)
@@ -1400,5 +1403,592 @@ async def run_migration(migration_file: str = "002_dedupe_and_unique_constraints
     msg = f"Migration {migration_file} applied successfully."
     print(msg)
     return msg
+
+
+# ---------------------------------------------------------------------------
+# Single-GPU pipeline — A100 80GB, all L1+L2+L3 in one container
+#
+# Design rationale (senior ML team):
+#   - One cold start instead of three.
+#   - Qwen3-VL-8B loaded in @modal.enter() so Triton JIT compiles during
+#     container init — by the time L3 starts, inference is instant.
+#   - L1 (DINOv2 ~330MB + Whisper ~3GB) and L2 (onnxruntime ~2GB) run while
+#     Qwen occupies 16GB: total peak VRAM ~21GB < 80GB, zero pressure.
+#   - max_num_seqs=48: KV budget = 80×0.80-16 = 48GB → 48 seqs * 1GB each,
+#     capped at 48 to keep decode efficient (diminishing returns above ~64).
+#   - Video stays in /tmp — no inter-container volume staging.
+#
+# Simulates: A100 80GB VRAM / 16 vCPU / 112 GB RAM
+# ---------------------------------------------------------------------------
+
+single_gpu_image = (
+    modal.Image.from_registry("nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", add_python="3.11")
+    .apt_install(["ffmpeg", "libgl1", "libglib2.0-0", "git"])
+    .pip_install(
+        "torch==2.5.1", "torchvision==0.20.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install([
+        # L1: ASHFS + Whisper
+        "faster-whisper>=1.0",
+        "scenedetect>=0.6",
+        "timm>=1.0",
+        # L2: Face analysis + Color grading
+        # 1.19.2 not 1.20.0: 1.20.0 needs transform_tensor_ex_fp from cuDNN 9.3+
+        # which vLLM's bundled nvidia-cudnn-cu12==9.1.x doesn't export.
+        "onnxruntime-gpu==1.19.2",
+        "onnx>=1.16",
+        "onnxconverter-common>=1.14",
+        "av>=12.0",
+        "requests>=2.32",
+        "scipy>=1.13",
+        "scikit-learn>=1.5",
+        "scikit-image>=0.24",
+        "matplotlib>=3.9",
+        "numba>=0.60",
+        # L3: Qwen vLLM + local embedder
+        "vllm>=0.6",
+        "transformers>=4.45",
+        "accelerate>=0.34",
+        "pillow>=10.4",
+        "sentence-transformers>=3.0,<4.0",
+        # shared
+        "tqdm>=4.66",
+        "pyyaml>=6.0",
+    ] + _BASE_PKGS)
+    .run_commands("pip uninstall -y torchcodec 2>/dev/null || true")
+    .env({
+        "HF_HOME": "/vol/models/huggingface",
+        "TORCH_HOME": "/vol/models/torch",
+        "INSIGHTFACE_HOME": "/vol/models/insightface",
+        "ORT_CACHE_DIR": "/vol/models/ort",
+        "VLLM_CACHE_ROOT": "/vol/models/vllm",
+        "TRANSFORMERS_CACHE": "/vol/models/huggingface",
+        "SENTENCE_TRANSFORMERS_HOME": "/vol/models/sentence_transformers",
+    })
+    .add_local_dir(str(_THIS_DIR), remote_path="/app")
+    .add_local_dir(str(_SIBLING_ROOT / "ashfs"), remote_path="/app_modules/ashfs", ignore=[".git"])
+    .add_local_dir(str(_SIBLING_ROOT / "face_analysis-model"), remote_path="/app_modules/face_analysis", ignore=[".git"])
+    .add_local_dir(str(_SIBLING_ROOT / "color-grading"), remote_path="/app_modules/color_grading", ignore=[".git"])
+)
+
+
+@app.cls(
+    gpu="a100-80gb",
+    cpu=16,
+    memory=112 * 1024,  # 112 GB RAM in MiB
+    image=single_gpu_image,
+    timeout=21600,
+    secrets=[modal.Secret.from_name("video-kb-secrets")],
+    volumes=_ALL_VOLUMES,
+)
+class SingleGPUPipeline:
+    """Full L1+L2+L3 pipeline in a single A100-80GB container.
+
+    Qwen3-VL-8B loads lazily at L3 start so L1 (DINOv2) and L2 (ONNX face)
+    run with full GPU VRAM — no 45 GB KV-cache competing for bandwidth.
+    """
+
+    @modal.enter()
+    def load_models(self) -> None:
+        import sys
+        sys.path.insert(0, "/app")
+        from models.qwen_vllm import QwenVLLM  # type: ignore[import]
+        logger.info("[SingleGPU] Pre-loading Qwen3-VL-8B during container init ...")
+        self.qwen = QwenVLLM.get()
+        self.qwen.load()  # warms GPU clocks, initialises CUDA context, compiles Triton kernels
+        logger.info("[SingleGPU] Qwen ready. Container accepting L1→L2→L3 jobs.")
+
+    @modal.method()
+    async def run(
+        self,
+        video_path: str,
+        video_id: str | None = None,
+        cast_db_r2_key: str | None = None,
+        cast_list: list[dict] | None = None,
+    ) -> dict:
+        """Run L1 → L2 → L3 sequentially inside this container.
+
+        Args:
+            video_path:     URL, R2 key (videos/...), or local path.
+            video_id:       Stable ID — generated if None.
+            cast_db_r2_key: R2 key for pre-built cast SQLite DB.
+            cast_list:      Inline cast [{"name": ..., "images": [...]}].
+
+        Returns:
+            Dict with video_id, status, frames_analysed, wall_timings.
+        """
+        import asyncio
+        import concurrent.futures as _cf
+        import dataclasses
+        import os
+        import sys
+        import tempfile
+        import time as _t
+        import urllib.request as _req
+
+        sys.path.insert(0, "/app")
+        sys.path.insert(0, "/app_modules/ashfs")
+        sys.path.insert(0, "/app_modules/color_grading")
+
+        import cv2  # type: ignore[import]
+
+        from shared.utils import gen_id, StepTimer, frame_to_png_bytes, ProgressTracker  # type: ignore[import]
+        from knowledge_base.postgres.client import get_pool  # type: ignore[import]
+        from knowledge_base.postgres.schema import run_migrations  # type: ignore[import]
+        from knowledge_base.postgres.queries import (  # type: ignore[import]
+            upsert_video, upsert_job, update_job_status, update_job_meta,
+            bulk_insert_chunks, bulk_insert_shots, bulk_insert_keyframes,
+            bulk_insert_transcript_segments, bulk_insert_frame_analyses,
+            get_shots_for_video, get_keyframes_for_video, get_level_status,
+            get_persons_for_video, get_transcript_segments_for_video,
+            get_face_appearances_for_video_sampled, get_existing_frame_analyses,
+        )
+        from knowledge_base.r2.uploader import download_bytes, upload_frame as r2_upload_frame  # type: ignore[import]
+        from shared.types import (  # type: ignore[import]
+            VideoMeta, ProcessingJob, LevelStatus,
+            TranscriptSegment, PersonRecord, FaceAppearanceRecord,
+            FaceTimelineEvent, ColorGradeRecord,
+        )
+        from pipeline.level1.ashfs_runner import run_ashfs, parse_ashfs_manifest  # type: ignore[import]
+        from pipeline.level1.whisper_runner import run_whisper  # type: ignore[import]
+        from pipeline.level1.aligner import align_transcript_to_chunks  # type: ignore[import]
+        from pipeline.level2.face_runner import run_face_analysis  # type: ignore[import]
+        from pipeline.level2.color_runner import run_color_grading  # type: ignore[import]
+        from pipeline.level2.updater import write_level2_to_kb  # type: ignore[import]
+        from pipeline.level3.context_builder import build_all_frame_contexts  # type: ignore[import]
+        from pipeline.level3.qwen_runner import run_qwen_analysis  # type: ignore[import]
+        from pipeline.level3.kb_finalizer import finalize_level3_kb, _build_frame_analysis_records  # type: ignore[import]
+
+        wall = StepTimer()
+        if not video_id:
+            import hashlib as _hl
+            video_id = _hl.sha256(video_path.encode()).hexdigest()[:32]
+            logger.info("[SingleGPU] video_id derived from URL hash: %s", video_id)
+        logger.info("[SingleGPU] video_id=%s  path=%s", video_id, video_path)
+
+        # ── 0. Download video to /tmp ──────────────────────────────────────
+        suffix = ".mp4" if ".mp4" in video_path.lower() else ".video"
+        _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        _tmp.close()
+        local_video_path = _tmp.name
+
+        with wall.step("video_download"):
+            if video_path.startswith(("http://", "https://")):
+                req = _req.Request(video_path, headers={"User-Agent": "Mozilla/5.0"})
+                with _req.urlopen(req) as resp, open(local_video_path, "wb") as f:
+                    f.write(resp.read())
+            elif video_path.startswith("videos/"):
+                with open(local_video_path, "wb") as f:
+                    f.write(download_bytes(video_path))
+            elif os.path.exists(video_path):
+                import shutil
+                shutil.copy2(video_path, local_video_path)
+            else:
+                raise FileNotFoundError(f"Video not found: {video_path!r}")
+
+        # Probe
+        cap = cv2.VideoCapture(local_video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration_s = frame_count / fps if fps > 0 else 0.0
+        cap.release()
+        logger.info("[SingleGPU] Video: fps=%.2f frames=%d %dx%d %.1fs", fps, frame_count, width, height, duration_s)
+
+        # ── DB init ────────────────────────────────────────────────────────
+        pool = await get_pool()
+        await run_migrations(pool)
+        await upsert_video(pool, VideoMeta(
+            id=video_id, path=video_path,
+            r2_key=video_path if video_path.startswith("videos/") else None,
+            duration_s=duration_s, fps=fps, width=width, height=height,
+        ))
+
+        # ══════════════════════════════════════════════════════════════════
+        # L1 — ASHFS + Whisper parallel
+        # ══════════════════════════════════════════════════════════════════
+        _l1_status = await get_level_status(pool, video_id, 1)
+        if _l1_status == LevelStatus.DONE:
+            logger.info("[L1] Already DONE — skipping.")
+        else:
+            await upsert_job(pool, ProcessingJob(
+                id=gen_id(), video_id=video_id, level=1,
+                status=LevelStatus.RUNNING, error_msg=None, meta={},
+            ))
+            try:
+                l1_t = StepTimer()
+
+                def _ashfs():
+                    t0 = _t.perf_counter()
+                    m = run_ashfs(local_video_path, video_id, "/tmp")
+                    l1_t.record("ashfs", _t.perf_counter() - t0)
+                    return m
+
+                def _whisper():
+                    t0 = _t.perf_counter()
+                    segs = run_whisper(local_video_path, video_id, "/tmp")
+                    l1_t.record("whisper", _t.perf_counter() - t0)
+                    return [dataclasses.asdict(s) for s in segs]
+
+                # Sequential: ASHFS/DINOv2 first, then Whisper.
+                # Parallel causes Whisper CUDA OOM because vLLM reserves 61 GB
+                # (16 GB model + 45 GB KV cache), leaving ~19 GB. DINOv2 retains
+                # activation blocks in PyTorch's CUDA caching allocator after
+                # processing, so CTranslate2 (Whisper) sees only ~9 GB free at
+                # the driver level → OOM. gc.collect + empty_cache flushes those
+                # blocks back to the driver before Whisper loads.
+                with wall.step("l1_ashfs"):
+                    manifest = await asyncio.to_thread(_ashfs)
+
+                # Flush PyTorch CUDA allocator cache so CTranslate2 (faster-whisper)
+                # can see the freed DINOv2 activation memory via cudaMalloc.
+                try:
+                    import gc as _gc
+                    import torch as _torch
+                    _gc.collect()
+                    reserved_before = _torch.cuda.memory_reserved() / 1024**3
+                    _torch.cuda.empty_cache()
+                    reserved_after = _torch.cuda.memory_reserved() / 1024**3
+                    logger.info(
+                        "[GPU] Post-ASHFS cache flush: %.1f GiB → %.1f GiB reserved (freed %.1f GiB)",
+                        reserved_before, reserved_after, reserved_before - reserved_after,
+                    )
+                except Exception as _flush_exc:
+                    logger.warning("[GPU] Post-ASHFS cache flush failed (non-fatal): %s", _flush_exc)
+
+                with wall.step("l1_whisper"):
+                    segments_data = await asyncio.to_thread(_whisper)
+
+                chunks, shots, keyframes = parse_ashfs_manifest(manifest, video_id)
+
+                def _upload_frame(args: tuple) -> tuple[str, str | None]:
+                    kf_id, fidx, vpath, vid = args
+                    _c = cv2.VideoCapture(vpath)
+                    _c.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+                    ret, frame = _c.read()
+                    _c.release()
+                    if not ret:
+                        return kf_id, None
+                    try:
+                        return kf_id, r2_upload_frame(frame_to_png_bytes(frame), vid, fidx)
+                    except Exception as _e:
+                        logger.warning("[L1] R2 upload failed frame %d: %s", fidx, _e)
+                        return kf_id, None
+
+                upload_args = [(kf.id, kf.frame_index, local_video_path, video_id) for kf in keyframes]
+                kf_id_to_r2: dict[str, str] = {}
+                prog = ProgressTracker("R2 uploads", total=len(keyframes), logger=logger, log_every=50)
+                with wall.step("l1_r2_upload"):
+                    with _cf.ThreadPoolExecutor(max_workers=16) as _ex:
+                        for kid, rk in _ex.map(_upload_frame, upload_args):
+                            if rk:
+                                kf_id_to_r2[kid] = rk
+                            prog.update(1)
+                prog.done()
+                for kf in keyframes:
+                    kf.r2_key = kf_id_to_r2.get(kf.id)
+
+                segments = [
+                    TranscriptSegment(
+                        id=s["id"], video_id=s["video_id"], chunk_id=s.get("chunk_id"),
+                        text=s["text"], start_time=float(s["start_time"]),
+                        end_time=float(s["end_time"]), confidence=s.get("confidence"),
+                        words=s.get("words") or [],
+                    )
+                    for s in segments_data
+                ]
+                segments = align_transcript_to_chunks(segments, chunks)
+
+                with wall.step("l1_db_write"):
+                    await bulk_insert_chunks(pool, chunks)
+                    await bulk_insert_shots(pool, shots)
+                    await bulk_insert_keyframes(pool, keyframes)
+                    if segments:
+                        await bulk_insert_transcript_segments(pool, segments)
+
+                await update_job_status(pool, video_id, 1, LevelStatus.DONE)
+                await update_job_meta(pool, video_id, 1, {
+                    **l1_t.summary(), "chunks": len(chunks),
+                    "shots": len(shots), "keyframes": len(keyframes),
+                    "segments": len(segments), "r2_uploaded": len(kf_id_to_r2),
+                })
+                logger.info("[L1] Done: %d chunks %d shots %d kf %d segs", len(chunks), len(shots), len(keyframes), len(segments))
+
+            except Exception as exc:
+                logger.error("[L1] FAILED: %s", exc, exc_info=True)
+                await update_job_status(pool, video_id, 1, LevelStatus.FAILED, str(exc))
+                try:
+                    os.unlink(local_video_path)
+                except OSError:
+                    pass
+                return {"video_id": video_id, "status": "failed_at_level1", "error": str(exc)}
+
+        # Release any PyTorch CUDA cache left by DINOv2/Whisper before L2 ONNX models load.
+        try:
+            import torch as _torch
+            _torch.cuda.empty_cache()
+            logger.info("[GPU] CUDA cache cleared after L1")
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════════════════════════
+        # L2 — Face + Color parallel
+        # ══════════════════════════════════════════════════════════════════
+        _l2_status = await get_level_status(pool, video_id, 2)
+        if _l2_status == LevelStatus.DONE:
+            logger.info("[L2] Already DONE — skipping.")
+        else:
+            await upsert_job(pool, ProcessingJob(
+                id=gen_id(), video_id=video_id, level=2,
+                status=LevelStatus.RUNNING, error_msg=None, meta={},
+            ))
+            try:
+                l2_t = StepTimer()
+                db_shots = await get_shots_for_video(pool, video_id)
+                _kfs = await get_keyframes_for_video(pool, video_id)
+                kf_ts = [kf.timestamp_s for kf in _kfs if kf.timestamp_s is not None]
+
+                cast_db_path: str | None = None
+                cast_db_tmp = None
+                if cast_list:
+                    from pipeline.level2.face_runner import build_cast_db_from_cast_list  # type: ignore[import]
+                    cast_db_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+                    cast_db_tmp.close()
+                    cast_db_path = cast_db_tmp.name
+                    build_cast_db_from_cast_list(cast_list, cast_db_path)
+                elif cast_db_r2_key:
+                    cast_db_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+                    cast_db_tmp.write(download_bytes(cast_db_r2_key))
+                    cast_db_tmp.close()
+                    cast_db_path = cast_db_tmp.name
+
+                face_result: dict = {}
+                color_result_list: list = []
+
+                def _face():
+                    t0 = _t.perf_counter()
+                    r = run_face_analysis(
+                        local_video_path, video_id, cast_db_path,
+                        keyframe_timestamps=kf_ts,
+                        shots=[dataclasses.asdict(s) for s in db_shots],
+                    )
+                    l2_t.record("face_analysis", _t.perf_counter() - t0)
+                    return r
+
+                def _color():
+                    t0 = _t.perf_counter()
+                    r = run_color_grading(local_video_path, video_id, db_shots)
+                    l2_t.record("color_grading", _t.perf_counter() - t0)
+                    return r
+
+                with wall.step("l2_face_color"):
+                    try:
+                        with _cf.ThreadPoolExecutor(max_workers=2) as _pool2:
+                            _ff = _pool2.submit(_face)
+                            _fc = _pool2.submit(_color)
+                            face_result = _ff.result()
+                            color_result_list = _fc.result()
+                    finally:
+                        if cast_db_tmp:
+                            for _ext in (".db", ".pkl"):
+                                try:
+                                    os.unlink(cast_db_tmp.name.removesuffix(".db") + _ext)
+                                except OSError:
+                                    pass
+
+                # run_face_analysis and run_color_grading return dataclass objects
+                # directly (unlike run_level2_modal which serialises to dicts).
+                persons: list[PersonRecord] = face_result["persons"]
+                appearances: list[FaceAppearanceRecord] = face_result["appearances"]
+                timeline_events: list[FaceTimelineEvent] = face_result["timeline_events"]
+                color_grades: list[ColorGradeRecord] = color_result_list
+
+                with wall.step("l2_db_write"):
+                    await write_level2_to_kb(pool, video_id, persons, appearances, timeline_events, color_grades)
+
+                await update_job_status(pool, video_id, 2, LevelStatus.DONE)
+                await update_job_meta(pool, video_id, 2, {
+                    **l2_t.summary(), "persons": len(persons),
+                    "appearances": len(appearances), "color_grades": len(color_grades),
+                })
+                logger.info("[L2] Done: %d persons %d appearances %d color grades", len(persons), len(appearances), len(color_grades))
+
+            except Exception as exc:
+                logger.error("[L2] FAILED (non-fatal): %s", exc, exc_info=True)
+                await update_job_status(pool, video_id, 2, LevelStatus.FAILED, str(exc))
+
+        # Release ONNX/OpenCV CUDA allocations before Qwen inference begins.
+        try:
+            import torch as _torch
+            _torch.cuda.empty_cache()
+            logger.info("[GPU] CUDA cache cleared after L2")
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════════════════════════
+        # L3 — Qwen VL (pre-loaded in @modal.enter) + KB write
+        # ══════════════════════════════════════════════════════════════════
+        _l3_status = await get_level_status(pool, video_id, 3)
+        if _l3_status == LevelStatus.DONE:
+            logger.info("[L3] Already DONE — skipping.")
+            try:
+                os.unlink(local_video_path)
+            except OSError:
+                pass
+            return {"video_id": video_id, "status": "complete", "frames_analysed": 0, "wall_timings": wall.summary()["steps"]}
+
+        await upsert_job(pool, ProcessingJob(
+            id=gen_id(), video_id=video_id, level=3,
+            status=LevelStatus.RUNNING, error_msg=None, meta={},
+        ))
+        frames_analysed = 0
+        try:
+            l3_t = StepTimer()
+
+            with wall.step("l3_db_load"):
+                keyframes = await get_keyframes_for_video(pool, video_id)
+                shots = await get_shots_for_video(pool, video_id)
+                transcript_segs = await get_transcript_segments_for_video(pool, video_id)
+                persons = await get_persons_for_video(pool, video_id)
+                appearances = await get_face_appearances_for_video_sampled(pool, video_id)
+
+            if not keyframes:
+                raise RuntimeError(f"No keyframes in DB for video_id={video_id}. Run L1 first.")
+
+            existing = await get_existing_frame_analyses(pool, [kf.id for kf in keyframes])
+            kf_map = {kf.id: kf for kf in keyframes}
+
+            if len(existing) == len(keyframes):
+                logger.info("[L3] All %d keyframes already analysed — loading from DB", len(keyframes))
+                frame_results = [(kf_map[kid], out) for kid, out in existing.items()]
+            else:
+                already_done = set(existing.keys())
+                missing_kfs = [kf for kf in keyframes if kf.id not in already_done]
+                logger.info(
+                    "[L3] %d/%d keyframes need Qwen inference (%d already in DB)",
+                    len(missing_kfs), len(keyframes), len(already_done),
+                )
+                contexts = build_all_frame_contexts(missing_kfs, transcript_segs, appearances, persons)
+
+                # Chunk inference so very long videos (1000+ keyframes) write
+                # progress to DB periodically.  If the container is interrupted,
+                # the next run skips already-completed frames via existing check.
+                _L3_CHUNK = 300
+                chunk_results: list[tuple] = []
+                with wall.step("l3_qwen_inference"):
+                    for _ci in range(0, len(contexts), _L3_CHUNK):
+                        _chunk_ctx = contexts[_ci: _ci + _L3_CHUNK]
+                        logger.info(
+                            "[L3] Qwen chunk %d-%d / %d",
+                            _ci, min(_ci + _L3_CHUNK, len(contexts)) - 1, len(contexts),
+                        )
+                        _chunk_res = await run_qwen_analysis(_chunk_ctx)
+                        chunk_results.extend(_chunk_res)
+
+                        # Write frame_analyses for this chunk immediately so
+                        # progress survives container interruption.
+                        _partial_analyses = _build_frame_analysis_records(_chunk_res)
+                        if _partial_analyses:
+                            try:
+                                await bulk_insert_frame_analyses(pool, _partial_analyses)
+                                logger.info("[L3] Checkpoint: wrote %d frame_analyses to DB", len(_partial_analyses))
+                            except Exception as _ce:
+                                logger.warning("[L3] Checkpoint write failed (non-fatal): %s", _ce)
+
+                # Combine newly inferred + already-existing results for finalize.
+                frame_results = chunk_results + [(kf_map[kid], out) for kid, out in existing.items()]
+
+            with wall.step("l3_kb_finalize"):
+                await finalize_level3_kb(pool, video_id, frame_results, persons, shots)
+
+            frames_analysed = sum(1 for _, out in frame_results if out is not None)
+            await update_job_status(pool, video_id, 3, LevelStatus.DONE)
+            await update_job_meta(pool, video_id, 3, {
+                **l3_t.summary(), "frames_analysed": frames_analysed,
+                "keyframes_total": len(keyframes),
+            })
+            logger.info("[L3] Done: %d frames analysed", frames_analysed)
+
+        except Exception as exc:
+            logger.error("[L3] FAILED: %s", exc, exc_info=True)
+            await update_job_status(pool, video_id, 3, LevelStatus.FAILED, str(exc))
+            try:
+                os.unlink(local_video_path)
+            except OSError:
+                pass
+            return {"video_id": video_id, "status": "failed_at_level3", "error": str(exc)}
+
+        try:
+            os.unlink(local_video_path)
+        except OSError:
+            pass
+
+        wall_summary = wall.summary()
+        logger.info(
+            "[SingleGPU] Pipeline complete video_id=%s frames=%d total=%.0fs",
+            video_id, frames_analysed, wall_summary["total_s"],
+        )
+        return {
+            "video_id": video_id,
+            "status": "complete",
+            "frames_analysed": frames_analysed,
+            "wall_timings": wall_summary["steps"],
+            "total_s": wall_summary["total_s"],
+        }
+
+
+@app.local_entrypoint()
+def main_single_gpu(
+    input_json: str,
+    video_id: str = "",
+) -> None:
+    """Run the full pipeline in a single A100-80GB container.
+
+    Usage::
+
+        modal run modal_app.py::main_single_gpu --input-json input.json
+        modal run modal_app.py::main_single_gpu --input-json input.json --video-id <id>
+    """
+    import json as _json
+
+    with open(input_json, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    video_url: str = data.get("video", {}).get("url", "")
+    if not video_url:
+        raise ValueError("input JSON missing video.url")
+
+    raw_cast: list[dict] = data.get("cast", [])
+    cast_list: list[dict] | None = (
+        [
+            {
+                "name": e["name"],
+                "images": [e["reference_image"]] if "reference_image" in e else e.get("images", []),
+            }
+            for e in raw_cast if e.get("name")
+        ]
+        or None
+    )
+
+    if not video_id:
+        import hashlib as _hl
+        video_id = _hl.sha256(video_url.encode()).hexdigest()[:32]
+
+    print(f"[single-gpu] Video    : {video_url}")
+    print(f"[single-gpu] video_id : {video_id}  (stable hash — safe to re-run with --video-id {video_id})")
+    print(f"[single-gpu] Cast     : {[c['name'] for c in cast_list] if cast_list else 'none'}")
+
+    pipeline = SingleGPUPipeline()
+    result = pipeline.run.remote(video_url, video_id, None, cast_list)
+    print(result)
+
+    timings = result.get("wall_timings") or {}
+    if timings:
+        print("\n[single-gpu] Timing breakdown:")
+        for step, secs in timings.items():
+            print(f"  {step:40s} {secs:6.0f}s  ({secs/60:.1f} min)")
+        total = result.get("total_s", 0)
+        print(f"  {'TOTAL':40s} {total:6.0f}s  ({total/60:.1f} min)")
 
 

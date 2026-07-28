@@ -17,7 +17,7 @@ _EDGE_BATCH_SIZE = 500
 
 async def ensure_constraints(database: str | None = None) -> None:
     """Create uniqueness constraints for each node type. Run once at startup."""
-    node_types = ["Video", "Shot", "Frame", "Scene", "Person", "Object", "Theme", "Chunk"]
+    node_types = ["Video", "Shot", "Frame", "Scene", "Person", "Object", "Theme", "Chunk", "Location", "Emotion"]
     async with neo4j_session(database) as session:
         for node_type in node_types:
             # Unique constraint on (node_type, ref_id) — idempotent
