@@ -201,14 +201,34 @@ class QwenSetting(BaseModel):
     indoor_outdoor: str
 
 
+_VALID_SHOTS = {"wide", "medium", "close", "extreme_close", "static", "unknown"}
+_VALID_ANGLES = {"eye-level", "low", "high", "dutch", "unknown"}
+_VALID_MOVEMENTS = {"static", "pan", "tilt", "zoom", "handheld", "unknown"}
+
+
 class QwenComposition(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    shot: Literal["wide", "medium", "close", "extreme_close", "static", "unknown"]
-    angle: Literal["eye-level", "low", "high", "dutch", "unknown"]
-    movement: Literal["static", "pan", "tilt", "zoom", "handheld", "unknown"]
+    shot: str = "unknown"
+    angle: str = "unknown"
+    movement: str = "static"
     framing: str
     depth: str
+
+    @field_validator("shot", mode="before")
+    @classmethod
+    def coerce_shot(cls, v: object) -> str:
+        return v if isinstance(v, str) and v in _VALID_SHOTS else "unknown"
+
+    @field_validator("angle", mode="before")
+    @classmethod
+    def coerce_angle(cls, v: object) -> str:
+        return v if isinstance(v, str) and v in _VALID_ANGLES else "unknown"
+
+    @field_validator("movement", mode="before")
+    @classmethod
+    def coerce_movement(cls, v: object) -> str:
+        return v if isinstance(v, str) and v in _VALID_MOVEMENTS else "static"
 
 
 class QwenLightingColor(BaseModel):
