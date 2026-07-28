@@ -21,6 +21,7 @@ from shared.types import (
     QwenFrameOutput,
     SearchableFactRecord,
     ShotRecord,
+    SpeakerTurnRecord,
     TranscriptSegment,
     VideoMeta,
 )
@@ -608,6 +609,62 @@ async def bulk_insert_face_timeline_events(
         """,
         records,
     )
+
+
+# ---------------------------------------------------------------------------
+# Speaker turns (Level-2 Stage 0: diarization fused with ArcFace identity)
+# ---------------------------------------------------------------------------
+
+
+async def bulk_insert_speaker_turns(
+    pool: asyncpg.Pool, turns: list[SpeakerTurnRecord]
+) -> None:
+    if not turns:
+        return
+    records = [
+        (
+            _to_uuid(t.id),
+            _to_uuid(t.video_id),
+            t.cluster_label,
+            _to_uuid(t.person_id),
+            t.start_time,
+            t.end_time,
+            t.confidence,
+            t.resolution_method,
+        )
+        for t in turns
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO speaker_turns
+            (id, video_id, cluster_label, person_id, start_time, end_time, confidence, resolution_method)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        records,
+    )
+
+
+async def get_speaker_turns_for_video(
+    pool: asyncpg.Pool, video_id: str
+) -> list[SpeakerTurnRecord]:
+    rows = await pool.fetch(
+        "SELECT * FROM speaker_turns WHERE video_id = $1 ORDER BY start_time",
+        _to_uuid(video_id),
+    )
+    return [
+        SpeakerTurnRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]),
+            cluster_label=r["cluster_label"],
+            person_id=str(r["person_id"]) if r["person_id"] is not None else None,
+            start_time=r["start_time"],
+            end_time=r["end_time"],
+            confidence=r["confidence"],
+            resolution_method=r["resolution_method"],
+        )
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

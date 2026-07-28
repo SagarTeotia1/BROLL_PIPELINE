@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     NEO4J_DATABASE: str = "neo4j"
 
     # ------------------------------------------------------------------
+    # Speaker diarization (Level-2 Stage 0)
+    # ------------------------------------------------------------------
+    # Gated model on HuggingFace — requires HF_TOKEN with accepted license
+    # for pyannote/speaker-diarization-3.1 (and its dependency segmentation-3.0).
+    PYANNOTE_MODEL: str = "pyannote/speaker-diarization-3.1"
+
+    # ------------------------------------------------------------------
     # Optional integrations
     # ------------------------------------------------------------------
     # OPENAI_API_KEY is kept for future use only — it is NOT used for

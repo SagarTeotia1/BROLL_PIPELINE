@@ -11,6 +11,7 @@ import logging
 from knowledge_base.postgres.queries import (
     bulk_insert_face_appearances,
     bulk_insert_face_timeline_events,
+    bulk_insert_speaker_turns,
     bulk_upsert_color_grades,
     upsert_color_grade,
     upsert_person,
@@ -20,6 +21,7 @@ from shared.types import (
     FaceAppearanceRecord,
     FaceTimelineEvent,
     PersonRecord,
+    SpeakerTurnRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ async def write_level2_to_kb(
     appearances: list[FaceAppearanceRecord],
     timeline_events: list[FaceTimelineEvent],
     color_grades: list[ColorGradeRecord],
+    speaker_turns: list[SpeakerTurnRecord] | None = None,
 ) -> None:
     """Persist all Level-2 analysis results to the knowledge base.
 
@@ -45,7 +48,12 @@ async def write_level2_to_kb(
         appearances:     Face appearance records from ``run_face_analysis``.
         timeline_events: Face timeline event records from ``run_face_analysis``.
         color_grades:    Color grade records from ``run_color_grading``.
+        speaker_turns:   Speaker turn records from ``fuse_diarization_with_faces``
+                         (Stage 0). ``person_id`` on these still refers to the
+                         pre-upsert UUIDs from ``run_face_analysis`` — remapped
+                         below using the same table used for appearances/events.
     """
+    speaker_turns = speaker_turns or []
     # ------------------------------------------------------------------
     # 1. Upsert persons.
     #
@@ -86,6 +94,9 @@ async def write_level2_to_kb(
         for ev in timeline_events:
             if ev.person_id in uuid_remap:
                 ev.person_id = uuid_remap[ev.person_id]
+        for turn in speaker_turns:
+            if turn.person_id in uuid_remap:
+                turn.person_id = uuid_remap[turn.person_id]
 
     logger.info(
         "Upserted %d/%d person records for video %s",
@@ -208,12 +219,49 @@ async def write_level2_to_kb(
         video_id,
     )
 
+    # ------------------------------------------------------------------
+    # 5. Insert speaker turns (Stage 0: diarization fused w/ face identity)
+    #    — best-effort per record, bulk first, per-record fallback.
+    # ------------------------------------------------------------------
+    inserted_turns = 0
+    if speaker_turns:
+        try:
+            await bulk_insert_speaker_turns(pool, speaker_turns)
+            inserted_turns = len(speaker_turns)
+        except Exception as bulk_exc:
+            logger.warning(
+                "bulk_insert_speaker_turns failed for video %s (%s) — "
+                "falling back to per-record inserts.",
+                video_id,
+                bulk_exc,
+            )
+            for turn in speaker_turns:
+                try:
+                    await bulk_insert_speaker_turns(pool, [turn])
+                    inserted_turns += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping speaker turn id=%s (video=%s): %s",
+                        turn.id,
+                        video_id,
+                        exc,
+                    )
+        logger.info(
+            "Inserted %d/%d speaker turn records for video %s",
+            inserted_turns,
+            len(speaker_turns),
+            video_id,
+        )
+    else:
+        logger.info("No speaker turns to insert for video %s", video_id)
+
     logger.info(
         "Level-2 KB write complete for video %s — "
-        "persons=%d appearances=%d timeline_events=%d color_grades=%d",
+        "persons=%d appearances=%d timeline_events=%d color_grades=%d speaker_turns=%d",
         video_id,
         len(upserted_person_ids),
         len(appearances),
         len(timeline_events),
         inserted_grades,
+        inserted_turns,
     )

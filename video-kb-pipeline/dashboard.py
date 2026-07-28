@@ -108,12 +108,13 @@ def counts(vid):
             (SELECT COUNT(*) FROM persons             WHERE video_id=%s::uuid) AS persons,
             (SELECT COUNT(*) FROM face_appearances    WHERE video_id=%s::uuid) AS face_appearances,
             (SELECT COUNT(*) FROM face_timeline_events WHERE video_id=%s::uuid) AS timeline_events,
+            (SELECT COUNT(*) FROM speaker_turns       WHERE video_id=%s::uuid) AS speaker_turns,
             (SELECT COUNT(*) FROM color_grades        WHERE video_id=%s::uuid) AS color_grades,
             (SELECT COUNT(*) FROM frame_analyses      WHERE video_id=%s::uuid) AS frame_analyses,
             (SELECT COUNT(*) FROM searchable_facts    WHERE video_id=%s::uuid) AS facts,
             (SELECT COUNT(*) FROM kg_nodes            WHERE video_id=%s::uuid) AS kg_nodes,
             (SELECT COUNT(*) FROM kg_edges            WHERE video_id=%s::uuid) AS kg_edges
-    """, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid)
+    """, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid, vid)
 
 
 # ── Paginated fetchers ────────────────────────────────────────────────────────
@@ -165,6 +166,17 @@ def face_timeline(vid):
         FROM face_timeline_events fte
         LEFT JOIN persons p ON p.id = fte.person_id
         WHERE fte.video_id=%s::uuid ORDER BY fte.start_time
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def speaker_turns(vid):
+    return q("""
+        SELECT st.cluster_label, st.start_time, st.end_time, st.confidence,
+               st.resolution_method, p.pid, p.display_name
+        FROM speaker_turns st
+        LEFT JOIN persons p ON p.id = st.person_id
+        WHERE st.video_id=%s::uuid ORDER BY st.start_time
     """, vid)
 
 
@@ -438,12 +450,12 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 T = st.tabs(["▶ Player", "📊 Overview", "🗂 Chunks", "🎬 Shots", "🖼 Keyframes",
              "📝 Transcript", "👤 Persons", "😊 Face Appearances", "😐 Emotions",
-             "🎨 Color Grades", "🧠 Frame Analysis", "💡 Facts", "🕸 KG Nodes",
+             "🗣 Diarization", "🎨 Color Grades", "🧠 Frame Analysis", "💡 Facts", "🕸 KG Nodes",
              "🔗 KG Edges", "🌐 Neo4j", "🔍 Search"])
 
 (tab_player, tab_overview, tab_chunks, tab_shots, tab_kf,
  tab_trans, tab_persons, tab_faces, tab_emotions,
- tab_color, tab_analysis, tab_facts, tab_kgnodes,
+ tab_diarization, tab_color, tab_analysis, tab_facts, tab_kgnodes,
  tab_kgedges, tab_neo4j, tab_search) = T
 
 
@@ -599,6 +611,7 @@ with tab_overview:
         ("Transcript segs",  _cnt.get("transcript_segs", 0)),
         ("Persons",          _cnt.get("persons", 0)),
         ("Face appearances", _cnt.get("face_appearances", 0)),
+        ("Speaker turns",    _cnt.get("speaker_turns", 0)),
         ("Color grades",     _cnt.get("color_grades", 0)),
         ("Frame analyses",   _cnt.get("frame_analyses", 0)),
         ("Searchable facts", _cnt.get("facts", 0)),
@@ -992,6 +1005,52 @@ with tab_emotions:
         emo_cnt.columns = ["Emotion", "Count"]
         col2.plotly_chart(px.bar(emo_cnt, x="Emotion", y="Count", color="Emotion",
             title="Event count by emotion", height=260), use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🗣 DIARIZATION (Level-2 Stage 0: pyannote turns fused w/ ArcFace identity)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_diarization:
+    st.header("Speaker Diarization (L2 Stage 0)")
+    _st_turns = speaker_turns(VID)
+    if not _st_turns:
+        st.info("No speaker turns. Diarization may not have run for this video "
+                "(non-fatal step — check HF_TOKEN + pyannote model license acceptance).")
+    else:
+        import pandas as pd, plotly.express as px
+
+        df = pd.DataFrame([{
+            "Speaker": t.get("display_name") or t.get("pid") or "unresolved",
+            "Cluster": t["cluster_label"],
+            "Start": t["start_time"] or 0,
+            "End": t["end_time"] or 0,
+            "Duration (s)": round((t["end_time"] or 0) - (t["start_time"] or 0), 2),
+            "Confidence": round(t["confidence"], 3) if t.get("confidence") is not None else "—",
+            "Resolution": t["resolution_method"],
+        } for t in _st_turns])
+
+        n_unresolved = (df["Resolution"] == "unresolved").sum()
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total turns", len(df))
+        col2.metric("Resolved to a person", len(df) - n_unresolved)
+        col3.metric("Unresolved (needs L5 grounding)", n_unresolved)
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        fig = px.timeline(df, x_start="Start", x_end="End", y="Speaker", color="Resolution",
+            title="Speaker turns — colored by fusion resolution method",
+            hover_data=["Cluster", "Duration (s)", "Confidence"])
+        fig.update_xaxes(title="Time (s)")
+        st.plotly_chart(fig, use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        dur_by_speaker = df.groupby("Speaker")["Duration (s)"].sum().reset_index()
+        col1.plotly_chart(px.pie(dur_by_speaker, names="Speaker", values="Duration (s)",
+            title="Talk time by speaker", height=260), use_container_width=True)
+        res_cnt = df["Resolution"].value_counts().reset_index()
+        res_cnt.columns = ["Resolution", "Count"]
+        col2.plotly_chart(px.bar(res_cnt, x="Resolution", y="Count", color="Resolution",
+            title="Turns by resolution method (trust cascade)", height=260), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

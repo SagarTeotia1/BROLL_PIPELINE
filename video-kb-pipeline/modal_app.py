@@ -160,7 +160,30 @@ face_color_image = (
         "numba>=0.60",
         "tqdm>=4.66",
         "pyyaml>=6.0",
+        "pyannote.audio>=3.1",   # Stage 0: speaker diarization
     ])
+    # pyannote.audio pulls torchaudio -> nvidia-cudnn-cu12 (pip wheel), which
+    # shadows the base image's apt-installed system cuDNN that onnxruntime-gpu
+    # was built against. Loading the wrong cuDNN aborts with "undefined symbol
+    # cudnnGetLibConfig" (SIGABRT). Uninstall the pip wheel so onnxruntime-gpu
+    # keeps using the working system cuDNN — same fix pattern as the
+    # torchcodec/qwen_image conflict below.
+    .run_commands("pip uninstall -y nvidia-cudnn-cu12 2>/dev/null || true")
+    # pyannote.audio's dependency resolution (speechbrain / pytorch-lightning
+    # transitively constrain torchvision) silently upgrades torchvision past
+    # the pin above, breaking its compiled-op ABI match with torch==2.5.1
+    # ("operator torchvision::nms does not exist"). Force-reinstall the exact
+    # matched torch/torchvision/torchaudio trio as the final step so nothing
+    # installed after this can drift them apart again.
+    .pip_install(
+        "torch==2.5.1", "torchvision==0.20.1", "torchaudio==2.5.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    # pyannote.audio pulls in torchcodec, which needs CUDA 13's libnvrtc.so.13
+    # — not present in this CUDA 12.4 image. Same conflict already solved for
+    # qwen_image below; pyannote's Audio class falls back to
+    # torchaudio/soundfile decoding when torchcodec is absent.
+    .run_commands("pip uninstall -y torchcodec 2>/dev/null || true")
     .env({
         "HF_HOME": "/vol/models/huggingface",
         "TORCH_HOME": "/vol/models/torch",
@@ -455,9 +478,15 @@ def run_level2_modal(
 
     from pipeline.level2.face_runner import run_face_analysis  # type: ignore[import]
     from pipeline.level2.color_runner import run_color_grading  # type: ignore[import]
+    from pipeline.level2.diarization_runner import run_diarization  # type: ignore[import]
+    from pipeline.level2.fusion import fuse_diarization_with_faces  # type: ignore[import]
     from shared.types import ShotRecord  # type: ignore[import]
 
     shots = [ShotRecord(**s) for s in shots_data]
+    # Cast count known upfront (user-provided) is a much stronger diarization
+    # hint than letting pyannote guess num_speakers — pass it through when
+    # available. Falls back to auto-detection when cast size is unknown.
+    num_speakers_hint = len(cast_list) if cast_list else None
 
     # Build / download cast DB — cast_list takes priority over cast_db_r2_key
     cast_db_path: str | None = None
@@ -516,13 +545,30 @@ def run_level2_modal(
     from shared.utils import StepTimer  # type: ignore[import]
     l2_inner_timer = StepTimer()
 
-    # Face (GPU bursts) and color grading (pure CPU) have zero resource conflict.
-    # Run them in parallel threads → wall clock = max(face, color) not sum.
+    # Pre-import torch/torchvision here, in the main thread, BEFORE the face
+    # + color + diarization threads below start. torchvision's internal
+    # submodule init (torchvision.extension) is not safe against two threads
+    # triggering its first import at the same time — face_analysis (via
+    # torch) and diarization (via torchaudio) racing on this causes
+    # "partially initialized module 'torchvision' ... circular import".
+    # Importing once up front caches it in sys.modules so the threads below
+    # never race on it.
+    import torch  # type: ignore[import]  # noqa: F401
+    try:
+        import torchvision  # type: ignore[import]  # noqa: F401
+    except ImportError:
+        pass
+
+    # Face (GPU bursts), color grading (pure CPU), and diarization (audio-only,
+    # short GPU burst) have zero resource conflict. Run all three in parallel
+    # threads → wall clock = max(face, color, diarization) not sum.
     import concurrent.futures as _cf
     face_exc: BaseException | None = None
     color_exc: BaseException | None = None
+    diar_exc: BaseException | None = None
     face_result: dict = {}
     color_result: list = []
+    diar_turns: list[dict] = []
 
     def _run_face():
         nonlocal face_exc
@@ -550,13 +596,30 @@ def run_level2_modal(
             color_exc = exc
             raise
 
-    logger.info("run_level2_modal: face + color grading in parallel for video_id=%s", video_id)
+    def _run_diarization():
+        nonlocal diar_exc
+        try:
+            t0 = _t.perf_counter()
+            result = run_diarization(
+                video_path, video_id, "/tmp", num_speakers=num_speakers_hint,
+            )
+            l2_inner_timer.record("diarization", _t.perf_counter() - t0)
+            return result
+        except Exception as exc:
+            # Non-fatal — Stage 0 is a fusion enhancement, not required for L2 to succeed.
+            diar_exc = exc
+            logger.warning("Diarization failed for video_id=%s (non-fatal): %s", video_id, exc)
+            return []
+
+    logger.info("run_level2_modal: face + color + diarization in parallel for video_id=%s", video_id)
     try:
-        with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+        with _cf.ThreadPoolExecutor(max_workers=3) as _pool:
             _face_fut = _pool.submit(_run_face)
             _color_fut = _pool.submit(_run_color)
+            _diar_fut = _pool.submit(_run_diarization)
             face_result = _face_fut.result()
             color_result = _color_fut.result()
+            diar_turns = _diar_fut.result()
     finally:
         if cast_db_tmp:
             # Remove both .db and .pkl sidecar — build_cast_db_from_cast_list
@@ -568,14 +631,19 @@ def run_level2_modal(
                 except OSError:
                     pass
 
+    speaker_turns = fuse_diarization_with_faces(
+        video_id, diar_turns, face_result["appearances"]
+    )
+
     _l2_inner = l2_inner_timer.summary()
     logger.info(
-        "run_level2_modal complete in %.0fs: persons=%d appearances=%d timeline=%d color=%d | timings=%s",
+        "run_level2_modal complete in %.0fs: persons=%d appearances=%d timeline=%d color=%d speaker_turns=%d | timings=%s",
         _l2_inner["total_s"],
         len(face_result["persons"]),
         len(face_result["appearances"]),
         len(face_result["timeline_events"]),
         len(color_result),
+        len(speaker_turns),
         _l2_inner["steps"],
     )
 
@@ -584,6 +652,7 @@ def run_level2_modal(
         "appearances": [dataclasses.asdict(a) for a in face_result["appearances"]],
         "timeline_events": [dataclasses.asdict(e) for e in face_result["timeline_events"]],
         "color_grades": [dataclasses.asdict(c) for c in color_result],
+        "speaker_turns": [dataclasses.asdict(s) for s in speaker_turns],
         "timings": _l2_inner["steps"],
     }
 
@@ -805,11 +874,14 @@ async def run_full_pipeline(
         FaceAppearanceRecord,
         FaceTimelineEvent,
         ColorGradeRecord,
+        SpeakerTurnRecord,
     )
     from shared.utils import frame_to_png_bytes  # type: ignore[import]
 
     pool = await get_pool()
     await run_migrations(pool)
+
+    import time as _t
 
     if not video_id:
         import hashlib as _hl
@@ -1120,12 +1192,26 @@ async def run_full_pipeline(
                 )
                 for c in l2_result["color_grades"]
             ]
+            speaker_turns = [
+                SpeakerTurnRecord(
+                    id=t["id"],
+                    video_id=t["video_id"],
+                    cluster_label=t["cluster_label"],
+                    person_id=t.get("person_id"),
+                    start_time=float(t["start_time"]),
+                    end_time=float(t["end_time"]),
+                    confidence=float(t["confidence"]) if t.get("confidence") is not None else None,
+                    resolution_method=t.get("resolution_method", "unresolved"),
+                )
+                for t in l2_result.get("speaker_turns", [])
+            ]
 
             from pipeline.level2.updater import write_level2_to_kb  # type: ignore[import]
 
             with l2_timer.step("db_write"):
                 await write_level2_to_kb(
-                    pool, video_id, persons, appearances, timeline_events, color_grades
+                    pool, video_id, persons, appearances, timeline_events, color_grades,
+                    speaker_turns,
                 )
 
             await update_job_status(pool, video_id, 2, LevelStatus.DONE)
@@ -1136,10 +1222,11 @@ async def run_full_pipeline(
                 "appearances": len(appearances),
                 "timeline_events": len(timeline_events),
                 "color_grades": len(color_grades),
+                "speaker_turns": len(speaker_turns),
             })
             logger.info(
-                "[L2] Complete: persons=%d appearances=%d timeline=%d color=%d",
-                len(persons), len(appearances), len(timeline_events), len(color_grades),
+                "[L2] Complete: persons=%d appearances=%d timeline=%d color=%d speaker_turns=%d",
+                len(persons), len(appearances), len(timeline_events), len(color_grades), len(speaker_turns),
             )
             l2_timer.log(logger, f"L2 — Face + Color grading  (video_id={video_id[:8]})")
 
@@ -1455,8 +1542,22 @@ single_gpu_image = (
         # shared
         "tqdm>=4.66",
         "pyyaml>=6.0",
+        "pyannote.audio>=3.1",   # Stage 0: speaker diarization
     ] + _BASE_PKGS)
     .run_commands("pip uninstall -y torchcodec 2>/dev/null || true")
+    # NOTE: unlike face_color_image, do NOT uninstall nvidia-cudnn-cu12 here —
+    # this image's onnxruntime-gpu==1.19.2 pin exists specifically to match
+    # vLLM's bundled nvidia-cudnn-cu12==9.1.x pip wheel (see comment above).
+    # Removing it would break vLLM/L3 in this single-container image.
+    #
+    # pyannote.audio's dependency resolution can still silently upgrade
+    # torchvision past the pin above, breaking its compiled-op ABI match with
+    # torch==2.5.1 ("operator torchvision::nms does not exist"). Force-pin
+    # the matched trio back as the final step.
+    .pip_install(
+        "torch==2.5.1", "torchvision==0.20.1", "torchaudio==2.5.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
     .env({
         "HF_HOME": "/vol/models/huggingface",
         "TORCH_HOME": "/vol/models/torch",
@@ -1548,13 +1649,15 @@ class SingleGPUPipeline:
         from shared.types import (  # type: ignore[import]
             VideoMeta, ProcessingJob, LevelStatus,
             TranscriptSegment, PersonRecord, FaceAppearanceRecord,
-            FaceTimelineEvent, ColorGradeRecord,
+            FaceTimelineEvent, ColorGradeRecord, SpeakerTurnRecord,
         )
         from pipeline.level1.ashfs_runner import run_ashfs, parse_ashfs_manifest  # type: ignore[import]
         from pipeline.level1.whisper_runner import run_whisper  # type: ignore[import]
         from pipeline.level1.aligner import align_transcript_to_chunks  # type: ignore[import]
         from pipeline.level2.face_runner import run_face_analysis  # type: ignore[import]
         from pipeline.level2.color_runner import run_color_grading  # type: ignore[import]
+        from pipeline.level2.diarization_runner import run_diarization  # type: ignore[import]
+        from pipeline.level2.fusion import fuse_diarization_with_faces  # type: ignore[import]
         from pipeline.level2.updater import write_level2_to_kb  # type: ignore[import]
         from pipeline.level3.context_builder import build_all_frame_contexts  # type: ignore[import]
         from pipeline.level3.qwen_runner import run_qwen_analysis  # type: ignore[import]
@@ -1763,8 +1866,19 @@ class SingleGPUPipeline:
                     cast_db_tmp.close()
                     cast_db_path = cast_db_tmp.name
 
+                # Pre-import torch/torchvision here to avoid the concurrent
+                # first-import race between face_analysis and diarization
+                # threads below — see comment in run_level2_modal.
+                import torch as _torch_prewarm  # type: ignore[import]  # noqa: F401
+                try:
+                    import torchvision as _torchvision_prewarm  # type: ignore[import]  # noqa: F401
+                except ImportError:
+                    pass
+
                 face_result: dict = {}
                 color_result_list: list = []
+                diar_turns: list[dict] = []
+                num_speakers_hint = len(cast_list) if cast_list else None
 
                 def _face():
                     t0 = _t.perf_counter()
@@ -1782,13 +1896,27 @@ class SingleGPUPipeline:
                     l2_t.record("color_grading", _t.perf_counter() - t0)
                     return r
 
+                def _diarize():
+                    t0 = _t.perf_counter()
+                    try:
+                        r = run_diarization(
+                            local_video_path, video_id, "/tmp", num_speakers=num_speakers_hint,
+                        )
+                    except Exception as _diar_exc:
+                        logger.warning("[L2] Diarization failed (non-fatal): %s", _diar_exc)
+                        r = []
+                    l2_t.record("diarization", _t.perf_counter() - t0)
+                    return r
+
                 with wall.step("l2_face_color"):
                     try:
-                        with _cf.ThreadPoolExecutor(max_workers=2) as _pool2:
+                        with _cf.ThreadPoolExecutor(max_workers=3) as _pool2:
                             _ff = _pool2.submit(_face)
                             _fc = _pool2.submit(_color)
+                            _fd = _pool2.submit(_diarize)
                             face_result = _ff.result()
                             color_result_list = _fc.result()
+                            diar_turns = _fd.result()
                     finally:
                         if cast_db_tmp:
                             for _ext in (".db", ".pkl"):
@@ -1803,16 +1931,26 @@ class SingleGPUPipeline:
                 appearances: list[FaceAppearanceRecord] = face_result["appearances"]
                 timeline_events: list[FaceTimelineEvent] = face_result["timeline_events"]
                 color_grades: list[ColorGradeRecord] = color_result_list
+                speaker_turns: list[SpeakerTurnRecord] = fuse_diarization_with_faces(
+                    video_id, diar_turns, appearances
+                )
 
                 with wall.step("l2_db_write"):
-                    await write_level2_to_kb(pool, video_id, persons, appearances, timeline_events, color_grades)
+                    await write_level2_to_kb(
+                        pool, video_id, persons, appearances, timeline_events, color_grades,
+                        speaker_turns,
+                    )
 
                 await update_job_status(pool, video_id, 2, LevelStatus.DONE)
                 await update_job_meta(pool, video_id, 2, {
                     **l2_t.summary(), "persons": len(persons),
                     "appearances": len(appearances), "color_grades": len(color_grades),
+                    "speaker_turns": len(speaker_turns),
                 })
-                logger.info("[L2] Done: %d persons %d appearances %d color grades", len(persons), len(appearances), len(color_grades))
+                logger.info(
+                    "[L2] Done: %d persons %d appearances %d color grades %d speaker turns",
+                    len(persons), len(appearances), len(color_grades), len(speaker_turns),
+                )
 
             except Exception as exc:
                 logger.error("[L2] FAILED (non-fatal): %s", exc, exc_info=True)

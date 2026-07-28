@@ -119,6 +119,18 @@ class FaceTimelineEvent:
 
 
 @dataclass
+class SpeakerTurnRecord:
+    id: str
+    video_id: str
+    cluster_label: str
+    person_id: str | None
+    start_time: float
+    end_time: float
+    confidence: float | None
+    resolution_method: str = "unresolved"  # face_majority | single_candidate | llm_tiebreak | unresolved
+
+
+@dataclass
 class ColorGradeRecord:
     id: str
     video_id: str
