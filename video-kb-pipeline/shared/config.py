@@ -65,6 +65,30 @@ class Settings(BaseSettings):
     PYANNOTE_MODEL: str = "pyannote/speaker-diarization-3.1"
 
     # ------------------------------------------------------------------
+    # Groq (Level-4 reasoning + Level-5 planning — Grounding Agent, Story
+    # Architect Agent, and L5's Selection/Sequencing passes all run on Groq).
+    # ------------------------------------------------------------------
+    # qwen/qwen3.6-27b is the only current Groq-hosted Qwen model (qwen3-32b
+    # deprecated 2026-06-17) — single tier, so cheap/strong-tier agents that
+    # used separate models on Anthropic now share this one model on Groq.
+    GROQ_API_KEY: str | None = None
+    L4_GROUNDING_MODEL: str = "qwen/qwen3.6-27b"
+    L4_STORY_ARCHITECT_MODEL: str = "qwen/qwen3.6-27b"
+    L4_ONTOLOGY_VERSION: int = 1
+    L5_SELECTION_MODEL: str = "qwen/qwen3.6-27b"
+    L5_SEQUENCING_MODEL: str = "qwen/qwen3.6-27b"
+    # Level-6 Caption/Text Overlay Agent — the one LLM-worthy decision in L6
+    # (caption STYLE only, never the text itself). Same single-tier Groq Qwen
+    # model as L4/L5 — see note above.
+    L6_CAPTION_MODEL: str = "qwen/qwen3.6-27b"
+    # Level-6 Color Grading Agent — sequence-delta computation (see
+    # pipeline/level6/color_grading_runner.py). Same single-tier Groq Qwen
+    # model as L4/L5 — kept as its own setting (rather than reusing
+    # L5_SEQUENCING_MODEL) so L6 agents can be retuned to a different model
+    # independently of planning, per the existing per-stage settings pattern.
+    L6_COLOR_MODEL: str = "qwen/qwen3.6-27b"
+
+    # ------------------------------------------------------------------
     # Optional integrations
     # ------------------------------------------------------------------
     # OPENAI_API_KEY is kept for future use only — it is NOT used for

@@ -20,6 +20,7 @@ _BATCH_SIZE = 100
 # Pinecone stores 1024-dim text embeddings (BAAI/bge-large-en-v1.5) for semantic search.
 _NS_FACTS = "facts"
 _NS_SCENES = "scenes"
+_NS_STORYLINES = "storylines"
 
 
 # ---------------------------------------------------------------------------
@@ -140,4 +141,107 @@ def upsert_scenes(scene_records: list[dict]) -> int:
         logger.debug("upsert_scenes: upserted batch of %d → total %d", len(vectors), total)
 
     logger.info("upsert_scenes: %d vectors upserted to namespace '%s'.", total, _NS_SCENES)
+    return total
+
+
+def upsert_canonical_scenes(scene_records: list[dict]) -> int:
+    """Upsert Level-4 canonical `scenes` (Postgres) rows into the ``scenes``
+    Pinecone namespace — one vector per canonical scene, replacing L3's loose
+    per-frame Scene-alias grouping as the source for this namespace.
+
+    Thin adapter over :func:`upsert_scenes`: reshapes each canonical scene
+    row into the dict shape ``upsert_scenes`` already expects (its signature
+    is generic enough to serve both), so batching/retry logic is not
+    duplicated.
+
+    Each record in *scene_records* must be a dict with:
+    - ``id`` (str): unique Pinecone vector id, e.g. ``f"{video_id}::{canonical_scene_id}"``
+    - ``video_id`` (str)
+    - ``canonical_scene_id`` (str)
+    - ``summary`` (str): the canonical scene summary — embedded text
+    - ``embedding`` (list[float]): 1024-dim embedding of ``summary``
+    - ``metadata`` (dict, optional): extra metadata (e.g. start_time, end_time, participants)
+
+    Records whose ``embedding`` is missing or ``None`` are skipped (handled
+    by ``upsert_scenes``).
+
+    Args:
+        scene_records: List of canonical scene dicts as described above.
+
+    Returns:
+        The total number of vectors successfully upserted.
+    """
+    mapped = [
+        {
+            "id": r["id"],
+            "video_id": r.get("video_id", ""),
+            "scene_id": r.get("canonical_scene_id", ""),
+            "caption": r.get("summary") or "",
+            "embedding": r.get("embedding"),
+            "metadata": r.get("metadata", {}) or {},
+        }
+        for r in scene_records
+    ]
+    return upsert_scenes(mapped)
+
+
+@retry(max_attempts=3, wait_seconds=2.0)
+def upsert_storylines(storyline_records: list[dict]) -> int:
+    """Upsert per-video storyline synopsis embeddings into the ``storylines``
+    Pinecone namespace — one vector per `storylines` row, only for rows with
+    ``status='final'`` (mirrors ``upsert_scenes``'s exact shape/style/batching).
+
+    This is what makes cross-video plot/theme search possible (e.g. "find
+    videos where someone gets ambushed on a football podcast") — no existing
+    namespace supports per-video narrative granularity; ``facts``/``scenes``
+    are per-frame/per-scene.
+
+    Each record in *storyline_records* must be a dict with:
+    - ``id`` (str): unique identifier used as the Pinecone vector ID,
+      e.g. ``f"{video_id}::v{version}"``
+    - ``video_id`` (str)
+    - ``storyline_id`` (str): the Postgres `storylines.id`
+    - ``version`` (int)
+    - ``title`` (str, optional)
+    - ``synopsis`` (str): the storyline synopsis text — embedded
+    - ``embedding`` (list[float]): 1024-dim text embedding of ``synopsis``
+
+    Records whose ``embedding`` key is missing or ``None`` are skipped.
+
+    Args:
+        storyline_records: List of storyline dicts as described above.
+
+    Returns:
+        The total number of vectors successfully upserted.
+    """
+    index = get_index()
+    eligible = [r for r in storyline_records if r.get("embedding") is not None]
+
+    if not eligible:
+        logger.debug("upsert_storylines: no eligible records.")
+        return 0
+
+    def _trunc(s: str, limit: int = 500) -> str:
+        return s[:limit] if len(s.encode()) > limit else s
+
+    total = 0
+    for batch in _batch(eligible, _BATCH_SIZE):
+        vectors: list[dict[str, Any]] = [
+            {
+                "id": r["id"],
+                "values": r["embedding"],
+                "metadata": {
+                    "video_id": r.get("video_id", ""),
+                    "storyline_id": r.get("storyline_id", ""),
+                    "version": r.get("version", 0),
+                    "title": _trunc(r.get("title") or ""),
+                },
+            }
+            for r in batch
+        ]
+        index.upsert(vectors=vectors, namespace=_NS_STORYLINES)
+        total += len(vectors)
+        logger.debug("upsert_storylines: upserted batch of %d → total %d", len(vectors), total)
+
+    logger.info("upsert_storylines: %d vectors upserted to namespace '%s'.", total, _NS_STORYLINES)
     return total

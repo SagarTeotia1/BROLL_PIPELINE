@@ -14,6 +14,7 @@ variables that the pipeline needs:
     R2_BUCKET_NAME          ...
     OPENAI_API_KEY          sk-...   (optional — NOT used for embeddings; local model used instead)
     HF_TOKEN                hf_...   (optional — required if model repo is gated)
+    ANTHROPIC_API_KEY       sk-ant-...   (required for L4 — Grounding Agent + Story Architect Agent)
 
 Deploy with:
     modal deploy modal_app.py
@@ -29,8 +30,11 @@ Architecture
       │     ASHFS + Whisper in parallel threads, reads from shared volume
       ├── run_level2_modal     (L2, gpu=L40S, face_color_image)
       │     face analysis + color grading, reads from shared volume
-      └── QwenAnalyserModal    (L3, gpu=L40S, qwen_image, @app.cls)
-            Qwen VL inference + KB write
+      ├── QwenAnalyserModal    (L3, gpu=L40S, qwen_image, @app.cls)
+      │     Qwen VL inference + KB write
+      └── run_level4_modal     (L4, CPU only, l4_image)
+            Grounding Agent (Groq API) + Story Architect Agent (Groq
+            API) + finalization gate — no GPU needed, not throughput-bound.
 """
 from __future__ import annotations
 
@@ -222,6 +226,32 @@ qwen_image = (
         "TORCH_HOME": "/vol/models/torch",
         "VLLM_CACHE_ROOT": "/vol/models/vllm",           # torch.compile cache — persists across cold starts (~40s saved)
         "TRANSFORMERS_CACHE": "/vol/models/huggingface",  # redundant with HF_HOME but some libs check this
+        "SENTENCE_TRANSFORMERS_HOME": "/vol/models/sentence_transformers",
+    })
+    .add_local_dir(str(_THIS_DIR), remote_path="/app")
+)
+
+# Level 4 (Grounding Agent + Story Architect Agent): CPU-only, lightweight.
+# L4 calls the Groq API for reasoning (not GPU-bound) and does a small
+# amount of local text embedding (BAAI/bge-large-en-v1.5, same model as L3)
+# over canonical scenes/storylines — O(dozens) of texts/video, not O(frames),
+# so CPU inference is fine here unlike L3's per-frame fact embeddings.
+# CPU torch wheel keeps this image small relative to the GPU images above.
+l4_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(["libgl1", "libglib2.0-0"])
+    .pip_install(_BASE_PKGS)
+    .pip_install(
+        "torch==2.5.1",
+        extra_index_url="https://download.pytorch.org/whl/cpu",
+    )
+    .pip_install([
+        "groq>=0.11",
+        "sentence-transformers>=3.0,<4.0",  # matches qwen_image's pin — avoids torchcodec pull
+    ])
+    .env({
+        "HF_HOME": "/vol/models/huggingface",
+        "TORCH_HOME": "/vol/models/torch",
         "SENTENCE_TRANSFORMERS_HOME": "/vol/models/sentence_transformers",
     })
     .add_local_dir(str(_THIS_DIR), remote_path="/app")
@@ -802,6 +832,53 @@ class QwenAnalyserModal:
 
 
 # ---------------------------------------------------------------------------
+# Level 4 — Reasoning (Grounding Agent + Story Architect Agent)
+#
+# CPU-only, no GPU: both agents call the Groq API (not local inference),
+# and the only local compute is a small amount of text embedding (BAAI/
+# bge-large-en-v1.5 on CPU) over canonical scenes/storylines — O(dozens) of
+# texts per video, not O(frames) like L3's per-frame fact embeddings, so it
+# does not need L40S throughput. A separate lightweight @app.function (rather
+# than running inline inside run_full_pipeline's base_image container) keeps
+# the groq/sentence-transformers dependency footprint out of the
+# orchestrator image and matches the existing "one container per level"
+# pattern used by L1/L2/L3.
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    timeout=3600,
+    image=l4_image,
+    secrets=[modal.Secret.from_name("video-kb-secrets")],
+    volumes=_MODEL_CACHE_VOLUMES,
+)
+async def run_level4_modal(video_id: str) -> dict:
+    """Run Level-4 reasoning (Grounding Agent + Story Architect Agent +
+    finalization gate) for *video_id*. Reads/writes Postgres directly —
+    does not need the staged video (L4 operates on already-extracted KB
+    data, never raw video/audio).
+
+    Returns the dict from `pipeline.level4.finalizer.finalize_level4`:
+    `{"ok": True, "storyline_version": int, "scenes_checked": int}` on
+    success, or `{"ok": False, "reason": "<specific failed check>"}`.
+    """
+    import sys
+    sys.path.insert(0, "/app")
+
+    from knowledge_base.postgres.client import get_pool  # type: ignore[import]
+    from knowledge_base.postgres.schema import run_migrations  # type: ignore[import]
+    from pipeline.level4.updater import run_level4  # type: ignore[import]
+
+    pool = await get_pool()
+    await run_migrations(pool)
+
+    logger.info("[L4 container] run_level4 start — video_id=%s", video_id)
+    result = await run_level4(pool, video_id)
+    logger.info("[L4 container] run_level4 complete — video_id=%s result=%s", video_id, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main Modal orchestrator function
 # ---------------------------------------------------------------------------
 
@@ -817,14 +894,15 @@ async def run_full_pipeline(
     video_id: str | None = None,
     cast_db_r2_key: str | None = None,
     cast_list: list[dict] | None = None,
-    stop_after: int = 3,
+    stop_after: int = 4,
 ) -> dict:
-    """Entry point: run the full L1 → L2 → L3 pipeline on Modal.
+    """Entry point: run the full L1 → L2 → L3 → L4 pipeline on Modal.
 
-    Coordinates level functions, writes all results to PostgreSQL + Pinecone.
+    Coordinates level functions, writes all results to PostgreSQL + Pinecone
+    (+ Neo4j, + Groq API for L4 reasoning).
 
     Args:
-        stop_after: Stop after this level (1, 2, or 3). Default 3 = full pipeline.
+        stop_after: Stop after this level (1, 2, 3, or 4). Default 4 = full pipeline.
 
     Args:
         video_path:       Local path to the video OR an R2 key (starting with
@@ -1243,91 +1321,158 @@ async def run_full_pipeline(
 
     # ------------------------------------------------------------------
     # Level 3 — Qwen VL analysis via QwenAnalyserModal class
-    # Skip if already DONE
+    # Skip if already DONE — falls through to L4 below rather than
+    # returning early (an L3-already-DONE video must still be able to
+    # reach L4 on a re-run — this used to return immediately here, which
+    # meant L4 could never be reached for any video whose L3 had already
+    # completed in an earlier run).
     # ------------------------------------------------------------------
+    frames_analysed = 0
     _l3_existing = await get_level_status(pool, video_id, 3)
     if _l3_existing == LevelStatus.DONE:
         logger.info("[L3] Already DONE for video_id=%s — skipping re-run.", video_id)
+    else:
+        await upsert_job(
+            pool,
+            ProcessingJob(
+                id=gen_id(),
+                video_id=video_id,
+                level=3,
+                status=LevelStatus.RUNNING,
+                error_msg=None,
+                meta={},
+            ),
+        )
+
+        try:
+            l3_timer = StepTimer()
+            # Split keyframes across N_SHARDS parallel L40s containers.
+            # Each shard loads the full KB (transcript, persons, appearances) but
+            # only runs Qwen inference + writes for its subset of keyframes.
+            # Writes are idempotent (ON CONFLICT DO UPDATE) so shards can overlap safely.
+            N_SHARDS = 1
+            # Always read keyframes from DB — L1 may have been skipped this run
+            from knowledge_base.postgres.queries import get_keyframes_for_video  # type: ignore[import]
+            keyframes = await get_keyframes_for_video(pool, video_id)
+            if not keyframes:
+                raise RuntimeError(f"No keyframes in DB for video_id={video_id}. Run L1 first.")
+            # Sort by timestamp so each shard gets a contiguous time window
+            kf_sorted = sorted(keyframes, key=lambda k: k.timestamp_s)
+            shard_size = -(-len(kf_sorted) // N_SHARDS)  # ceil
+            shards: list[list[str]] = [
+                [kf.id for kf in kf_sorted[i : i + shard_size]]
+                for i in range(0, len(kf_sorted), shard_size)
+            ]
+
+            logger.info(
+                "[L3] Dispatching %d parallel Qwen shards for video_id=%s (%d keyframes total)",
+                len(shards), video_id, len(kf_sorted),
+            )
+
+            analyser = QwenAnalyserModal()
+            shard_calls = [
+                analyser.analyse_video.remote.aio(
+                    video_id,
+                    keyframe_ids=shard_ids,
+                    shard_index=i,
+                    total_shards=len(shards),
+                )
+                for i, shard_ids in enumerate(shards)
+            ]
+            with l3_timer.step("qwen_inference_and_kb"):
+                shard_results = await asyncio.gather(*shard_calls)
+            frames_analysed = sum(r.get("frames_analysed", 0) for r in shard_results)
+
+            # Collect per-shard sub-timings (model_load, inference, kb_write, etc.)
+            merged_timings: dict[str, float] = {}
+            for sr in shard_results:
+                for k, v in (sr.get("timings") or {}).items():
+                    merged_timings[k] = merged_timings.get(k, 0) + v
+            for k, v in merged_timings.items():
+                l3_timer.record(k, v)
+
+            await update_job_status(pool, video_id, 3, LevelStatus.DONE)
+            _l3_summary = l3_timer.summary()
+            await update_job_meta(pool, video_id, 3, {
+                **_l3_summary,
+                "frames_analysed": frames_analysed,
+                "shards": len(shards),
+                "keyframes_total": len(kf_sorted),
+            })
+            logger.info("[L3] Complete: %d frames analysed across %d shards", frames_analysed, len(shards))
+            l3_timer.log(logger, f"L3 — Qwen VL + KB finalize  (video_id={video_id[:8]})")
+
+        except Exception as exc:
+            err_str = str(exc)
+            logger.error("[L3] FAILED: %s", err_str, exc_info=True)
+            await update_job_status(pool, video_id, 3, LevelStatus.FAILED, err_str)
+            await _cleanup_staged_video(staged_video_path)
+            return {"video_id": video_id, "status": "failed_at_level3", "error": err_str}
+
+    if stop_after == 3:
         await _cleanup_staged_video(staged_video_path)
-        return {"video_id": video_id, "status": "complete", "frames_analysed": 0}
+        logger.info("stop_after=3 — pipeline halted after L3. video_id=%s", video_id)
+        return {"video_id": video_id, "status": "done_level3", "frames_analysed": frames_analysed}
+
+    # ------------------------------------------------------------------
+    # Level 4 — Reasoning (Grounding Agent + Story Architect Agent)
+    # Runs in its own CPU-only container (run_level4_modal / l4_image) —
+    # no GPU needed, see the comment above that function's definition.
+    # Skip if already DONE.
+    # ------------------------------------------------------------------
+    _l4_existing = await get_level_status(pool, video_id, 4)
+    if _l4_existing == LevelStatus.DONE:
+        logger.info("[L4] Already DONE for video_id=%s — skipping re-run.", video_id)
+        await _cleanup_staged_video(staged_video_path)
+        return {"video_id": video_id, "status": "complete", "frames_analysed": frames_analysed}
 
     await upsert_job(
         pool,
         ProcessingJob(
             id=gen_id(),
             video_id=video_id,
-            level=3,
+            level=4,
             status=LevelStatus.RUNNING,
             error_msg=None,
             meta={},
         ),
     )
 
-    frames_analysed = 0
     try:
-        l3_timer = StepTimer()
-        # Split keyframes across N_SHARDS parallel L40s containers.
-        # Each shard loads the full KB (transcript, persons, appearances) but
-        # only runs Qwen inference + writes for its subset of keyframes.
-        # Writes are idempotent (ON CONFLICT DO UPDATE) so shards can overlap safely.
-        N_SHARDS = 1
-        # Always read keyframes from DB — L1 may have been skipped this run
-        from knowledge_base.postgres.queries import get_keyframes_for_video  # type: ignore[import]
-        keyframes = await get_keyframes_for_video(pool, video_id)
-        if not keyframes:
-            raise RuntimeError(f"No keyframes in DB for video_id={video_id}. Run L1 first.")
-        # Sort by timestamp so each shard gets a contiguous time window
-        kf_sorted = sorted(keyframes, key=lambda k: k.timestamp_s)
-        shard_size = -(-len(kf_sorted) // N_SHARDS)  # ceil
-        shards: list[list[str]] = [
-            [kf.id for kf in kf_sorted[i : i + shard_size]]
-            for i in range(0, len(kf_sorted), shard_size)
-        ]
+        l4_timer = StepTimer()
+        with l4_timer.step("grounding_and_story_architect"):
+            l4_result = await run_level4_modal.remote.aio(video_id)
 
-        logger.info(
-            "[L3] Dispatching %d parallel Qwen shards for video_id=%s (%d keyframes total)",
-            len(shards), video_id, len(kf_sorted),
-        )
+        if not l4_result.get("ok"):
+            # Quality gate failed (CLAUDE.md finalization contract) — this is
+            # NOT the same as an exception: the calls ran fine, but Postgres
+            # is not complete enough to trust. Job stays FAILED with the
+            # specific reason, never a green checkmark over incomplete data.
+            reason = l4_result.get("reason") or "L4 finalization checks failed (no reason given)"
+            logger.error("[L4] FAILED (finalization gate) for video_id=%s: %s", video_id, reason)
+            await update_job_status(pool, video_id, 4, LevelStatus.FAILED, reason)
+            await _cleanup_staged_video(staged_video_path)
+            return {"video_id": video_id, "status": "failed_at_level4", "error": reason}
 
-        analyser = QwenAnalyserModal()
-        shard_calls = [
-            analyser.analyse_video.remote.aio(
-                video_id,
-                keyframe_ids=shard_ids,
-                shard_index=i,
-                total_shards=len(shards),
-            )
-            for i, shard_ids in enumerate(shards)
-        ]
-        with l3_timer.step("qwen_inference_and_kb"):
-            shard_results = await asyncio.gather(*shard_calls)
-        frames_analysed = sum(r.get("frames_analysed", 0) for r in shard_results)
-
-        # Collect per-shard sub-timings (model_load, inference, kb_write, etc.)
-        merged_timings: dict[str, float] = {}
-        for sr in shard_results:
-            for k, v in (sr.get("timings") or {}).items():
-                merged_timings[k] = merged_timings.get(k, 0) + v
-        for k, v in merged_timings.items():
-            l3_timer.record(k, v)
-
-        await update_job_status(pool, video_id, 3, LevelStatus.DONE)
-        _l3_summary = l3_timer.summary()
-        await update_job_meta(pool, video_id, 3, {
-            **_l3_summary,
-            "frames_analysed": frames_analysed,
-            "shards": len(shards),
-            "keyframes_total": len(kf_sorted),
+        await update_job_status(pool, video_id, 4, LevelStatus.DONE)
+        _l4_summary = l4_timer.summary()
+        await update_job_meta(pool, video_id, 4, {
+            **_l4_summary,
+            "storyline_version": l4_result.get("storyline_version"),
+            "scenes_checked": l4_result.get("scenes_checked"),
         })
-        logger.info("[L3] Complete: %d frames analysed across %d shards", frames_analysed, len(shards))
-        l3_timer.log(logger, f"L3 — Qwen VL + KB finalize  (video_id={video_id[:8]})")
+        logger.info(
+            "[L4] Complete: storyline_version=%s scenes_checked=%s",
+            l4_result.get("storyline_version"), l4_result.get("scenes_checked"),
+        )
+        l4_timer.log(logger, f"L4 — Reasoning (Grounding + Story Architect)  (video_id={video_id[:8]})")
 
     except Exception as exc:
         err_str = str(exc)
-        logger.error("[L3] FAILED: %s", err_str, exc_info=True)
-        await update_job_status(pool, video_id, 3, LevelStatus.FAILED, err_str)
+        logger.error("[L4] FAILED: %s", err_str, exc_info=True)
+        await update_job_status(pool, video_id, 4, LevelStatus.FAILED, err_str)
         await _cleanup_staged_video(staged_video_path)
-        return {"video_id": video_id, "status": "failed_at_level3", "error": err_str}
+        return {"video_id": video_id, "status": "failed_at_level4", "error": err_str}
 
     await _cleanup_staged_video(staged_video_path)
 
@@ -1367,7 +1512,7 @@ async def _cleanup_staged_video(path: str) -> None:
 def main(
     input_json: str,
     video_id: str = "",
-    stop_after: int = 3,
+    stop_after: int = 4,
 ) -> None:
     """Run the full pipeline from a local terminal using a single input JSON file.
 

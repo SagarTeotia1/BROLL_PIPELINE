@@ -239,3 +239,119 @@ async def write_graph(
 async def query_graph(cypher: str, params: dict | None = None, database: str | None = None) -> list[dict]:
     """Run arbitrary Cypher query. Returns list of record dicts."""
     return await run_cypher(cypher, params, database)
+
+
+async def update_edge_relations_canonical(video_id: str, database: str | None = None) -> int:
+    """Correction pass: re-write Neo4j edge types for edges that now have a
+    ``kg_edges.canonical_relation`` set, using the canonical relation as the
+    Neo4j relationship type instead of the raw, freeform ``relation`` string.
+
+    This is what actually fixes the "200+ distinct Neo4j edge types" problem
+    documented in CLAUDE.md — L3's ``write_edges()`` always used raw
+    ``edge.relation``. Called by L4's grounding pass (1b relation
+    canonicalization) after ``kg_edges.canonical_relation`` has been written
+    to Postgres.
+
+    This is a correction/addition pass, NOT a full graph rebuild:
+    - Only edges with a non-null ``canonical_relation`` are touched.
+    - Edges without one are left completely alone (no regression — they just
+      keep their original raw-relation Neo4j edge type until L4 gets to them).
+    - The original raw-relation edge is not deleted; a MERGE adds/updates the
+      canonical-relation-typed edge alongside it (idempotent — safe to re-run).
+
+    Follows the exact same UNWIND-batched MERGE pattern as ``write_edges()``:
+    grouped by (src_type, tgt_type, canonical_relation), batched, with
+    per-edge fallback on batch failure, and the same Cypher-safe relation
+    sanitization via ``re.sub(r"[^A-Z0-9_]", "_", ...)``.
+
+    Args:
+        video_id: The video whose canonicalized edges should be propagated.
+        database: Optional Neo4j database name override.
+
+    Returns:
+        The total number of edges written (across successful batches +
+        per-edge fallbacks).
+    """
+    from knowledge_base.postgres.client import get_pool  # type: ignore[import]
+    from knowledge_base.postgres.queries import get_kg_edges_with_canonical_relation  # type: ignore[import]
+
+    pool = await get_pool()
+    rows = await get_kg_edges_with_canonical_relation(pool, video_id)
+
+    if not rows:
+        logger.info(
+            "update_edge_relations_canonical: no edges with canonical_relation set for video_id=%s",
+            video_id,
+        )
+        return 0
+
+    # Group by (src_type, tgt_type, safe_relation) — same UNWIND constraint as write_edges.
+    edge_groups: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        safe_rel = re.sub(r"[^A-Z0-9_]", "_", row["canonical_relation"].upper())[:64].strip("_") or "RELATES_TO"
+        edge_groups[(row["src_type"], row["tgt_type"], safe_rel)].append({
+            "src_ref_id": row["src_ref_id"],
+            "tgt_ref_id": row["tgt_ref_id"],
+            "video_id": video_id,
+            "weight": row["weight"],
+            "db_id": row["db_id"],
+            "raw_relation": row["raw_relation"],
+            "canonical_relation": row["canonical_relation"],
+        })
+
+    written = 0
+    async with neo4j_session(database) as session:
+        for (src_type, tgt_type, relation), group in edge_groups.items():
+            for i in range(0, len(group), _EDGE_BATCH_SIZE):
+                batch = group[i : i + _EDGE_BATCH_SIZE]
+                try:
+                    await session.run(
+                        f"""
+                        UNWIND $batch AS e
+                        MATCH (a:{src_type} {{ref_id: e.src_ref_id, video_id: e.video_id}})
+                        MATCH (b:{tgt_type} {{ref_id: e.tgt_ref_id, video_id: e.video_id}})
+                        MERGE (a)-[r:{relation}]->(b)
+                        SET r.weight = e.weight, r.db_id = e.db_id,
+                            r.raw_relation = e.raw_relation,
+                            r.canonical_relation = e.canonical_relation
+                        """,
+                        batch=batch,
+                    )
+                    written += len(batch)
+                except Exception as e:
+                    logger.warning(
+                        "Canonical edge UNWIND failed %s->%s [%s] (offset %d): %s — "
+                        "falling back to individual merges",
+                        src_type, tgt_type, relation, i, e,
+                    )
+                    for entry in batch:
+                        try:
+                            await session.run(
+                                f"""
+                                MATCH (a:{src_type} {{ref_id: $src_ref_id, video_id: $video_id}})
+                                MATCH (b:{tgt_type} {{ref_id: $tgt_ref_id, video_id: $video_id}})
+                                MERGE (a)-[r:{relation}]->(b)
+                                SET r.weight = $weight, r.db_id = $db_id,
+                                    r.raw_relation = $raw_relation,
+                                    r.canonical_relation = $canonical_relation
+                                """,
+                                src_ref_id=entry["src_ref_id"],
+                                tgt_ref_id=entry["tgt_ref_id"],
+                                video_id=entry["video_id"],
+                                weight=entry["weight"],
+                                db_id=entry["db_id"],
+                                raw_relation=entry["raw_relation"],
+                                canonical_relation=entry["canonical_relation"],
+                            )
+                            written += 1
+                        except Exception as e2:
+                            logger.warning(
+                                "Individual canonical edge merge failed %s->%s [%s]: %s",
+                                entry["src_ref_id"], entry["tgt_ref_id"], relation, e2,
+                            )
+
+    logger.info(
+        "update_edge_relations_canonical complete for video_id=%s: %d edge groups, %d edges written",
+        video_id, len(edge_groups), written,
+    )
+    return written
