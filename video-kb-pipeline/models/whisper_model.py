@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
+from faster_whisper import BatchedInferencePipeline
 from faster_whisper import WhisperModel as FasterWhisperModel
 
 from shared.types import TranscriptSegment
@@ -18,7 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 class WhisperModel:
-    """Thin wrapper around :class:`faster_whisper.WhisperModel`.
+    """Thin wrapper around :class:`faster_whisper.WhisperModel`, run through
+    :class:`faster_whisper.BatchedInferencePipeline`.
+
+    Real-video measurement (60min podcast, A100): the un-batched, non-VAD
+    sequential decode path took 11m35s (~5x realtime) — far below large-v3's
+    typical 10-15x realtime on this hardware. Root cause: (1) no VAD
+    filtering, so Whisper decodes through silence/pauses as if they were
+    speech; (2) sequential single-stream decoding instead of batched
+    chunk-parallel decoding, which ``BatchedInferencePipeline`` provides.
+    Batching is applied at the transcribe call, not the model load — the
+    underlying ``FasterWhisperModel`` is still loaded once and reused.
 
     The underlying model is loaded once at construction time and reused across
     all ``transcribe`` calls, so the GPU/CPU memory cost is paid only once per
@@ -57,9 +68,10 @@ class WhisperModel:
             device=device,
             compute_type=compute_type,
         )
+        self._batched_model = BatchedInferencePipeline(model=self._model)
         self._device = device
         self._model_size = model_size_or_path
-        logger.info("Whisper model loaded successfully.")
+        logger.info("Whisper model loaded successfully (batched inference pipeline ready).")
 
     # ------------------------------------------------------------------
     # Public API
@@ -89,11 +101,13 @@ class WhisperModel:
         """
         logger.info("Starting Whisper transcription for video_id=%s, audio=%s", video_id, audio_path)
 
-        segments_iter, info = self._model.transcribe(
+        segments_iter, info = self._batched_model.transcribe(
             audio_path,
             word_timestamps=True,
             beam_size=5,
             language=None,  # auto-detect
+            vad_filter=True,   # skip silence/non-speech — was decoding through it before
+            batch_size=16,     # chunk-parallel decode instead of one long sequential pass
         )
 
         logger.info(

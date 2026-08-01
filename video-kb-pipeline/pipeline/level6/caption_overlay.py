@@ -48,9 +48,11 @@ import logging
 import asyncpg
 
 from knowledge_base.postgres.queries import (
+    get_client_style_profile,
     get_edit_plan,
     get_frame_analyses_with_timestamps_for_video,
     get_transcript_segments_for_video,
+    get_video,
 )
 from shared.config import settings
 from shared.types import CaptionStyleItem, ChooseCaptionStyleOutput, TranscriptSegment
@@ -97,14 +99,11 @@ _TEXT_MATCH_MIN_RATIO = 0.90
 
 
 def _get_groq_client():
-    if not settings.GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not configured — Level-6 Caption Agent cannot "
-            "run without it (see shared/config.py)."
-        )
-    from groq import Groq  # local import — keeps this an optional dependency
+    """Name kept for minimal diff — actually returns an OpenRouter client
+    now (see shared/llm_client.py)."""
+    from shared.llm_client import get_llm_client
 
-    return Groq(api_key=settings.GROQ_API_KEY)
+    return get_llm_client()
 
 
 async def _call_groq_tool(
@@ -114,6 +113,10 @@ async def _call_groq_tool(
     tool_schema: dict,
     payload: dict,
     max_tokens: int,
+    *,
+    pool=None,
+    video_id: str | None = None,
+    stage: str | None = None,
 ) -> dict | None:
     """Call Groq's OpenAI-compatible `chat.completions.create` with a forced
     tool call, return the tool's structured arguments as a dict, or None if
@@ -121,9 +124,12 @@ async def _call_groq_tool(
     _call_groq_tool` for the full explanation of why Groq's shape differs
     from Anthropic's (`tool_calls[0].function.arguments` is a JSON STRING
     here, not a pre-parsed dict)."""
+    import time as _time
+
     fn_name = tool_schema["function"]["name"]
     last_exc: Exception | None = None
     for attempt in range(1, _LLM_CALL_ATTEMPTS + 1):
+        _t0 = _time.monotonic()
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -135,8 +141,12 @@ async def _call_groq_tool(
                 ],
                 tools=[tool_schema],
                 tool_choice={"type": "function", "function": {"name": fn_name}},
+                # See pipeline/level4/grounding_runner.py::_call_tool for the
+                # real-video finding behind this.
+                extra_body={"provider": {"require_parameters": True}},
             )
             usage = getattr(response, "usage", None)
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
             if usage is not None:
                 logger.info(
                     "L6 caption LLM call model=%s tool=%s prompt_tokens=%s completion_tokens=%s",
@@ -144,6 +154,18 @@ async def _call_groq_tool(
                     getattr(usage, "prompt_tokens", "?"),
                     getattr(usage, "completion_tokens", "?"),
                 )
+            # L7 7c — durable cost/latency log, non-fatal.
+            from shared.llm_client import log_llm_call as _log_llm_call
+            await _log_llm_call(
+                pool,
+                video_id=video_id,
+                level=6,
+                stage=stage or "l6_caption",
+                model=model,
+                prompt_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
+                completion_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
+                latency_ms=_latency_ms,
+            )
             choice = response.choices[0]
             tool_calls = getattr(choice.message, "tool_calls", None)
             if not tool_calls:
@@ -357,6 +379,15 @@ async def run_caption_overlay(pool: asyncpg.Pool, edit_plan_id: str) -> list[dic
       - a TEXT_OVERLAY_REQUEST whose time window has no real transcript
         text available at all (neither transcript_segments nor L3's
         dialogue_subtitle) — nothing grounded to caption with.
+
+    If this video's `client_id` resolves to a `client_style_profiles` row
+    with a non-empty `caption_style` (CLAUDE.md "PIPELINE ADDENDUM 2" ->
+    "3. Client Style Profiles"), it is passed to the LLM as an OPTIONAL
+    styling prior alongside the existing platform-target context — a SOFT
+    PRIOR only (rule 26), never a replacement for the per-line style
+    judgment this agent already makes, and never license to alter `text`.
+    No client_id, or a client_id with no profile / empty caption_style,
+    leaves that field null and reproduces exactly today's behavior.
     """
     plan = await get_edit_plan(pool, edit_plan_id)
     if plan is None:
@@ -419,6 +450,17 @@ async def run_caption_overlay(pool: asyncpg.Pool, edit_plan_id: str) -> list[dic
         logger.info("run_caption_overlay: edit_plan_id=%s no captionable TEXT_OVERLAY_REQUEST ops", edit_plan_id)
         return []
 
+    # CLAUDE.md "PIPELINE ADDENDUM 2" -> "3. Client Style Profiles":
+    # additive, soft-prior-only lookup. No client_id / no profile row /
+    # empty caption_style all leave client_caption_style as None, which
+    # reproduces exactly today's payload shape (see rule 26).
+    client_caption_style: dict | None = None
+    video = await get_video(pool, plan.video_id)
+    if video is not None and video.client_id:
+        profile = await get_client_style_profile(pool, video.client_id)
+        if profile is not None and profile.caption_style:
+            client_caption_style = profile.caption_style
+
     # ------------------------------------------------------------------
     # Batched Groq calls for style only.
     # ------------------------------------------------------------------
@@ -428,6 +470,7 @@ async def run_caption_overlay(pool: asyncpg.Pool, edit_plan_id: str) -> list[dic
     for batch in _chunk(items, _CAPTION_BATCH_SIZE):
         payload = {
             "platform": plan.platform,
+            "client_style_prior": client_caption_style,
             "captions": [
                 {"op_id": op_id, "transcript_text": info["text"], "start_time": info["start"], "end_time": info["end"]}
                 for op_id, info in batch
@@ -436,6 +479,7 @@ async def run_caption_overlay(pool: asyncpg.Pool, edit_plan_id: str) -> list[dic
         raw = await _call_groq_tool(
             client, settings.L6_CAPTION_MODEL, L6_CAPTION_STYLE_SYSTEM_PROMPT,
             CHOOSE_CAPTION_STYLE_TOOL, payload, _CAPTION_LLM_MAX_TOKENS,
+            pool=pool, video_id=plan.video_id, stage="l6_caption",
         )
         if raw is None:
             logger.error(

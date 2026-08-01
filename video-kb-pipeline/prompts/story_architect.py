@@ -27,6 +27,10 @@ Input (one batch of 3-5 consecutive scenes, chronological):
     this batch (empty on the first batch)
   scenes: [
     {
+      scene_index: 0-based position of this scene within THIS batch — echo
+        this back unchanged on the matching scene_beat so your beat can be
+        matched to the correct input scene. Every scene_index in this list
+        must appear exactly once in your scene_beats output.
       scene_frames: PRUNED frame_analyses for this scene — caption,
         causality, continuity, people[] (pid+story_role+action only, NOT
         full gaze/pose/clothing/apparel detail), beat_type, scene_mood,
@@ -40,6 +44,15 @@ Input (one batch of 3-5 consecutive scenes, chronological):
     ...
   ]
   cast: {pid: display_name}
+  client_style_examples: OPTIONAL. Present only when this video's client has \
+enough reward-scored history (CLAUDE.md "PIPELINE ADDENDUM 3" -> "LEVEL 9 \
+-- REWARD & PUNISHMENT", item 9b) -- a short list of that client's past \
+scene summaries that scored well. Usually an empty list, which must change \
+nothing about how you write. THIS IS A SOFT STYLE PRIOR, NEVER GROUNDED \
+CONTENT (rule 26): it may nudge phrasing/tone toward what has read well for \
+this client before, but it is NEVER a source of facts -- every scene_beat \
+you write must still be grounded ONLY in that scene's own scene_frames + \
+speaker_turns, exactly as before this field existed.
 
 For EACH scene in the batch:
   1. Merge that scene's frame-level scene_id variants into ONE canonical
@@ -56,6 +69,9 @@ Then, once for the whole batch:
      grow unbounded across batches.
 
 Return one scene_beat per input scene, via the write_scene_beats tool call.
+Every scene_beat MUST include the scene_index of the input scene it answers,
+copied verbatim from that scene's scene_index — this is how your beat is
+matched back to the correct scene, not the order you return them in.
 """
 
 # Tool/function schema (structured output) — see CLAUDE.md "Tool/function
@@ -82,13 +98,12 @@ WRITE_SCENE_BEATS_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
+                            "scene_index": {"type": "integer"},
                             "canonical_scene_id": {"type": "string"},
                             "discarded_aliases": {
                                 "type": "array",
                                 "items": {"type": "string"},
                             },
-                            "start_time": {"type": "number"},
-                            "end_time": {"type": "number"},
                             "participants": {
                                 "type": "array",
                                 "items": {"type": "string"},
@@ -98,10 +113,9 @@ WRITE_SCENE_BEATS_TOOL = {
                             "causal_link_to_next": {"type": ["string", "null"]},
                         },
                         "required": [
+                            "scene_index",
                             "canonical_scene_id",
                             "discarded_aliases",
-                            "start_time",
-                            "end_time",
                             "participants",
                             "summary",
                             "emotional_arc",

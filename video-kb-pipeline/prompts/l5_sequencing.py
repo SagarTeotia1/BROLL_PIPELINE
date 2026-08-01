@@ -35,10 +35,46 @@ Input:
   ]  — already pruned/ranked by Pass A, ordered by relevance_score \
 descending. Every scene here already cleared the user's hard constraints; \
 do not re-apply must_include/must_exclude judgment.
+  user_prompt: the user's original free-text editing request. Pass A \
+already used this to select *which* scenes are relevant — you use it only \
+for *ordering* language. If it contains an explicit structural instruction \
+(e.g. "start with X", "then Y", "end with Z", "open with the intro before \
+the interview"), honor that literal order for the scenes it names, using \
+whichever ranked_candidates entries match those named moments \
+(canonical_scene_id / summary) — this takes priority over the default \
+causal_link_to_next ordering for the scenes the instruction names. For \
+everything the instruction does NOT explicitly place, fall back to \
+causal_link_to_next chains as usual. Never invent a scene to satisfy the \
+instruction — if nothing in ranked_candidates matches what the user asked \
+for by name, leave that instruction unfulfilled rather than fabricating a \
+selection (rule 12/18 — closed-set discipline, no invented content). Null \
+or generic (no ordering language) means behave exactly as before this \
+field existed.
   target_duration_s: target output duration in seconds, or null
   platform: reel | full_cut | youtube | ... or null
   pacing_preference: e.g. "fast", "punchy", "slow", "conversational", or \
-null if unspecified
+null if unspecified — this is the user's own explicit request for THIS \
+edit, when given.
+  client_style_pacing_preference: OPTIONAL. Present only when this \
+video's client has a saved style profile (CLAUDE.md "PIPELINE ADDENDUM 2" \
+-> "3. Client Style Profiles") with a `pacing_preference` on file (e.g. \
+"fast", "moderate", "slow", learned from that client's past edits) — null \
+whenever no such profile exists, which is the common case and must change \
+nothing about how you plan. THIS IS A SOFT PRIOR, NEVER A HARD \
+CONSTRAINT (rule 26): use it only to lightly bias pacing/cut-density \
+choices that are otherwise a toss-up. It must NEVER override \
+causal_link_to_next, never justify cutting or reordering something a \
+scene's own grounded data doesn't support, and never take precedence over \
+the explicit per-edit `pacing_preference` above when the two disagree — \
+the user's explicit request for this specific edit always wins over a \
+learned client default.
+  client_style_examples: OPTIONAL, usually an empty list. Present only when \
+this video's client has enough reward-scored history (CLAUDE.md "PIPELINE \
+ADDENDUM 3" -> "LEVEL 9 -- REWARD & PUNISHMENT", item 9b) -- a short list \
+of that client's past scene summaries that scored well. THIS IS A SOFT \
+STYLE PRIOR, NEVER GROUNDED CONTENT (rule 26): it may nudge phrasing/tone, \
+never justify a cut, order, or rationale that ranked_candidates' own data \
+doesn't support. An empty list must change nothing about how you sequence.
 
 Build the ordered EditOperation[] array:
   - SELECT_CLIP: include a candidate scene, or a trimmed sub-range of it. \

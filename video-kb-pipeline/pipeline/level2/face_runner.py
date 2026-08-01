@@ -404,15 +404,19 @@ def run_face_analysis(
         pass
 
     # Tuned recognition thresholds — see build_cast_db_from_cast_list comments.
+    # reid_interval is NOT set here — it's duration-scaled in the auto-tune
+    # block below alongside frame_stride, same reasoning (real-video finding:
+    # face_analysis was the dominant, still-unfixed L2 cost on a real
+    # talking-head podcast; low-motion static-framing content doesn't need
+    # re-identification as often as the flat default assumed).
     try:
         config.recognition.similarity_threshold = 0.32
         config.recognition.margin_threshold     = 0.04
         config.recognition.min_votes            = 2
-        config.recognition.reid_interval        = 30
         config.quality.min_det_score            = 0.45
         logger.info(
             "GPU forced. Thresholds: similarity=0.32 margin=0.04 "
-            "min_votes=2 reid_interval=30 min_det_score=0.45"
+            "min_votes=2 min_det_score=0.45"
         )
     except Exception as _cfg_exc:
         logger.warning("Could not override recognition thresholds: %s", _cfg_exc)
@@ -431,15 +435,30 @@ def run_face_analysis(
         _cap.release()
         _duration_s = _total_frames_vid / max(_fps_vid, 1.0)
 
+        # Real-video finding: a 68.9min talking-head podcast (3 people,
+        # faces on-screen almost every sampled frame) landed in the >30min
+        # bucket at 17m37s for face_analysis alone — the dominant L2 cost,
+        # still unfixed at the model/inference level (TensorRT EP, IOBinding
+        # remain real options, not yet implemented — need live GPU iteration
+        # to do safely). These two bumps are the safe, config-only levers
+        # available without that: reid_interval scaled 2-3x looser (low-
+        # motion/static-framing content doesn't need to re-confirm identity
+        # as often as fast-cut dynamic content), and the >30min bucket's
+        # frame_stride bumped to match the >90min bucket's value — real
+        # accuracy/track-continuity tradeoff (ByteTrack bridges longer gaps
+        # between samples), not a free win.
         if _duration_s > 5400:          # > 90 min: coarse stride, still safe
             config.sampling.frame_stride = 8
             config.sampling.max_stride   = 24
+            config.recognition.reid_interval = 90
         elif _duration_s > 1800:        # > 30 min
-            config.sampling.frame_stride = 6
-            config.sampling.max_stride   = 16
+            config.sampling.frame_stride = 8    # was 6 — bumped to match >90min bucket
+            config.sampling.max_stride   = 20   # was 16 — scaled proportionally
+            config.recognition.reid_interval = 60  # was 30 (flat default)
         else:                            # < 30 min: default
             config.sampling.frame_stride = 4
             config.sampling.max_stride   = 8
+            config.recognition.reid_interval = 30
 
         config.detector.batch_size     = 8    # 4 → 8: doubles SCRFD throughput on A100
         config.recognition.batch_size  = 32   # 16 → 32
@@ -448,10 +467,11 @@ def run_face_analysis(
 
         logger.info(
             "Face pipeline auto-tuned: duration=%.0fs → stride=%d max_stride=%d "
-            "det_bs=%d rec_bs=%d emo_bs=%d ort_mem=%dMB",
+            "reid_interval=%d det_bs=%d rec_bs=%d emo_bs=%d ort_mem=%dMB",
             _duration_s,
             config.sampling.frame_stride,
             config.sampling.max_stride,
+            config.recognition.reid_interval,
             config.detector.batch_size,
             config.recognition.batch_size,
             config.emotion.batch_size,

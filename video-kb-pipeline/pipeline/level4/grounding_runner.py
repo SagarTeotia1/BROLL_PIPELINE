@@ -15,8 +15,8 @@ Implements the three sub-tasks described in CLAUDE.md "LEVEL 4 — REASONING"
                                     searchable_facts embeddings, no LLM call.
 
 Scope note: this module writes Postgres only (speaker_turns, kg_edges, and
-searchable_facts). Neo4j edge-type correction and Pinecone
-scenes/storylines projections are the responsibility of
+searchable_facts). Neo4j edge-type correction and the `scenes`/`storylines`
+pgvector embedding writes (B7 dropped Pinecone) are the responsibility of
 `pipeline/level4/updater.py` (out of scope for this module — see CLAUDE.md
 "Neo4j + Pinecone propagation").
 """
@@ -40,12 +40,12 @@ from knowledge_base.postgres.queries import (
     get_searchable_facts_for_video,
     get_transcript_segments_for_video,
     get_unresolved_speaker_turns,
+    insert_pipeline_alert,
 )
 from shared.config import settings
 from shared.types import (
     FaceAppearanceRecord,
-    RelationCanonicalizationBatch,
-    SpeakerResolutionBatch,
+    RelationClusterResult,
     SpeakerTurnRecord,
     TranscriptSegment,
 )
@@ -71,8 +71,30 @@ _SPEAKER_BATCH_SIZE = 35
 _RELATION_LLM_MAX_TOKENS = 4096
 _SPEAKER_LLM_MAX_TOKENS = 8192
 
+# Real-video finding: 1b sent every cluster in ONE uncapped call — with
+# CANONICALIZE_RELATIONS_TOOL requiring a `reasoning` string per cluster and
+# ~150+ distinct relation clusters typical for a video (CLAUDE.md's own
+# "200+ distinct relation strings observed" note), output routinely exceeded
+# _RELATION_LLM_MAX_TOKENS and got cut off mid-JSON ("Expecting ',' delimiter"
+# deep in the response) — a real truncation bug, not the "weak backend"
+# malformed-JSON case the retry logic was built for. This also explains the
+# climbing OTHER-bucket rate observed across reruns of the same video:
+# whichever clusters got truncated out varied run to run and silently
+# defaulted to OTHER. Sub-batch, same pattern as 1a's _SPEAKER_BATCH_SIZE —
+# closes the rule-23 gap (1b previously only capped raw_relations shown per
+# cluster, never the cluster count itself).
+_RELATION_BATCH_SIZE = 25
+
 # Confidence-gated escalation threshold (finalization contract #2).
 _LOW_CONFIDENCE_THRESHOLD = 0.5
+
+# CLAUDE.md B4 observability thresholds — not spec'd numerically there
+# (only the OTHER-bucket ~5% figure is), so these are conservative
+# defaults: a video tripping either signals it's worth a human look, same
+# "alert, don't silently decay" spirit as the OTHER-bucket check below.
+_UNRESOLVED_FINAL_RATE_THRESHOLD = 0.20   # >20% of turns permanently ambiguous
+_ESCALATION_TRIGGER_RATE_THRESHOLD = 0.30  # >30% of first-pass answers needed a 2nd (stronger) pass
+_OTHER_BUCKET_RATE_THRESHOLD = 0.05        # already spec'd in CLAUDE.md 1b
 
 # Embedding-similarity thresholds. Fact dedup's 0.95 is spec'd directly in
 # CLAUDE.md ("threshold ~0.95 cosine"); the relation-clustering threshold is
@@ -81,10 +103,18 @@ _LOW_CONFIDENCE_THRESHOLD = 0.5
 # are L2-normalised, so cosine similarity == dot product).
 _RELATION_CLUSTER_SIM_THRESHOLD = 0.86
 _FACT_DEDUP_SIM_THRESHOLD = 0.95
+# Real-video cost finding: clusters can have dozens of near-duplicate raw
+# relation strings; showing all of them bloated input tokens with no
+# decision-quality benefit. Cap the sample shown to the LLM — the full list
+# is still used for write-back (see run_relation_canonicalization).
+_MAX_RELATION_EXAMPLES_PER_CLUSTER = 8
 
 # Retries for a transient Groq API failure (network blip, 5xx) —
 # small and bounded, not a retry loop.
-_LLM_CALL_ATTEMPTS = 2
+_LLM_CALL_ATTEMPTS = 3  # bumped 2->3: malformed-JSON from cheaper OpenRouter-routed
+# models (no grammar-constrained tool-calling) is a confirmed real, somewhat
+# frequent failure mode on real video content — give it one more shot before
+# giving up on a batch.
 
 
 # ---------------------------------------------------------------------------
@@ -100,15 +130,13 @@ _LLM_CALL_ATTEMPTS = 2
 
 
 def _get_groq_client():
-    if not settings.GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not configured — Level-4 Grounding Agent "
-            "cannot run without it (see shared/config.py)."
-        )
-    import groq  # local import — keeps this an optional dependency for
-    # callers that only use run_fact_dedup (no LLM call needed there).
+    """Name kept for minimal diff across this module's call sites — actually
+    returns an OpenRouter client now (see shared/llm_client.py). Provider
+    moved from Groq to OpenRouter for the real cheap/strong two-tier split;
+    Groq remains available as an explicit fallback via get_llm_client(prefer_groq=True)."""
+    from shared.llm_client import get_llm_client
 
-    return groq.Groq(api_key=settings.GROQ_API_KEY)
+    return get_llm_client()
 
 
 async def _call_tool(
@@ -118,6 +146,10 @@ async def _call_tool(
     tool_schema: dict,
     payload: dict,
     max_tokens: int,
+    *,
+    pool: asyncpg.Pool | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
 ) -> dict | None:
     """Call the Groq chat.completions API with a forced tool call and return
     the tool call's structured arguments as a dict, or None if every attempt
@@ -131,17 +163,19 @@ async def _call_tool(
     shape (see prompts/grounding_speaker.py etc.) — NOT Anthropic's
     top-level `input_schema`.
     """
-    # groq's public exception hierarchy (groq.APIError / RateLimitError /
+    # openai's public exception hierarchy (openai.APIError / RateLimitError /
     # APIStatusError / APIConnectionError / ...) is Stainless-generated,
-    # same pattern as the anthropic SDK it replaces — imported here only so
-    # an ImportError surfaces clearly if the installed groq version ever
-    # drops these names.
-    import groq  # noqa: F401
+    # same pattern as the groq/anthropic SDKs it replaces — imported here
+    # only so an ImportError surfaces clearly if the installed openai
+    # version ever drops these names.
+    import openai  # noqa: F401
     import json as _json
+    import time as _time
 
     tool_name = tool_schema["function"]["name"]
     last_exc: Exception | None = None
     for attempt in range(1, _LLM_CALL_ATTEMPTS + 1):
+        _t0 = _time.monotonic()
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -153,8 +187,26 @@ async def _call_tool(
                 ],
                 tools=[tool_schema],
                 tool_choice={"type": "function", "function": {"name": tool_name}},
+                # Real-video finding: OpenRouter routes this model across
+                # multiple backend providers (Alibaba Cloud Int., SiliconFlow,
+                # Nebius observed) with inconsistent tool-calling reliability
+                # — some returned syntactically malformed JSON in forced tool
+                # calls. require_parameters restricts routing to providers
+                # that actually declare full support for every parameter in
+                # this request (tools/tool_choice included), filtering out
+                # weaker backends before they get a chance to misbehave.
+                # reasoning.enabled=False: grounding is closed-set
+                # classification, not synthesis — no benefit from a
+                # reasoning pass, and it only adds latency/cost across the
+                # high call volume this stage runs at (unlike Story
+                # Architect, which turns it on — see story_architect_runner.py).
+                extra_body={
+                    "provider": {"require_parameters": True},
+                    "reasoning": {"enabled": False},
+                },
             )
             usage = getattr(response, "usage", None)
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
             if usage is not None:
                 logger.info(
                     "L4 grounding LLM call model=%s tool=%s prompt_tokens=%s completion_tokens=%s",
@@ -163,25 +215,50 @@ async def _call_tool(
                     getattr(usage, "prompt_tokens", "?"),
                     getattr(usage, "completion_tokens", "?"),
                 )
+            # L7 7c — durable cost/latency log, non-fatal (see
+            # shared/llm_client.py::log_llm_call docstring).
+            from shared.llm_client import log_llm_call as _log_llm_call
+            await _log_llm_call(
+                pool,
+                video_id=video_id,
+                level=4,
+                stage=stage or "grounding",
+                model=model,
+                prompt_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
+                completion_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
+                latency_ms=_latency_ms,
+            )
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None) or []
+            found_tool_call = False
             for call in tool_calls:
                 if getattr(call.function, "name", None) == tool_name:
+                    found_tool_call = True
                     try:
                         return _json.loads(call.function.arguments)
                     except _json.JSONDecodeError as exc:
-                        logger.error(
-                            "L4 grounding LLM call returned malformed JSON in tool "
-                            "arguments (model=%s, tool=%s): %s",
-                            model, tool_name, exc,
+                        # Real-video finding: this used to `return None` here
+                        # immediately, on the FIRST attempt — bypassing
+                        # _LLM_CALL_ATTEMPTS entirely, even though malformed
+                        # JSON syntax from a cheaper OpenRouter-routed model
+                        # (no grammar-constrained tool-calling, unlike
+                        # vLLM's local guided decoding) is exactly the kind
+                        # of transient failure a retry is for. Fall through
+                        # to the next attempt instead of returning.
+                        last_exc = exc
+                        logger.warning(
+                            "L4 grounding LLM call attempt %d/%d returned malformed JSON "
+                            "in tool arguments (model=%s, tool=%s): %s",
+                            attempt, _LLM_CALL_ATTEMPTS, model, tool_name, exc,
                         )
-                        return None
-            logger.error(
-                "L4 grounding LLM call returned no matching tool_call (model=%s, tool=%s)",
-                model,
-                tool_name,
+                        break
+            if found_tool_call:
+                continue
+            logger.warning(
+                "L4 grounding LLM call attempt %d/%d returned no matching tool_call "
+                "(model=%s, tool=%s)",
+                attempt, _LLM_CALL_ATTEMPTS, model, tool_name,
             )
-            return None
         except Exception as exc:  # noqa: BLE001 — log & retry/return, never raise into caller loop
             last_exc = exc
             logger.warning(
@@ -204,6 +281,43 @@ async def _call_tool(
 
 def _chunk(items: list, size: int) -> list[list]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _parse_resolutions_lenient(raw: dict) -> list["SpeakerResolutionItem"]:
+    """Validate each item in raw["resolutions"] individually instead of the
+    whole batch at once via SpeakerResolutionBatch.model_validate().
+
+    Real-video finding: a batch of 35 turns had one malformed item mid-list
+    (a cheaper OpenRouter-routed model deviated from the tool schema partway
+    through a long structured output) — all-or-nothing batch validation
+    discarded every OTHER item in that batch too, including ones that were
+    genuinely valid. That's real data loss for turns the model actually
+    resolved correctly. Per-item validation keeps the good ones and only
+    drops the specific malformed entries, logged individually (still "reject
+    and log on schema mismatch," per rule 12 — just scoped to the item that
+    actually violated the schema, not everything sharing its batch).
+    """
+    from shared.types import SpeakerResolutionItem
+
+    items_raw = raw.get("resolutions")
+    if not isinstance(items_raw, list):
+        logger.error(
+            "run_speaker_resolution: 'resolutions' missing or not a list in tool output — "
+            "dropping entire response: %r", raw,
+        )
+        return []
+
+    valid: list[SpeakerResolutionItem] = []
+    for i, item_raw in enumerate(items_raw):
+        try:
+            valid.append(SpeakerResolutionItem.model_validate(item_raw))
+        except Exception as exc:
+            logger.error(
+                "run_speaker_resolution: dropping malformed resolution item at index %d "
+                "(kept %d valid items from the rest of this batch): %s | raw=%r",
+                i, len(valid), exc, item_raw,
+            )
+    return valid
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +419,10 @@ async def run_speaker_resolution(pool: asyncpg.Pool, video_id: str) -> list[Spea
         )
         updates = [(t.id, None, None, "llm_unresolved_final") for t in turns]
         await bulk_update_speaker_turn_resolutions(pool, updates)
+        await insert_pipeline_alert(
+            pool, video_id, 4, "l4_llm_unresolved_final_rate", 1.0,
+            _UNRESOLVED_FINAL_RATE_THRESHOLD,
+        )
         return [
             SpeakerTurnRecord(
                 id=t.id, video_id=t.video_id, cluster_label=t.cluster_label,
@@ -332,24 +450,30 @@ async def run_speaker_resolution(pool: asyncpg.Pool, video_id: str) -> list[Spea
     client = _get_groq_client()
 
     # ------------------------------------------------------------------
-    # First pass — cheap/fast tier, batched.
+    # First pass — cheap/fast tier, batched. Batches are independent (no
+    # shared state, no ordering requirement between them) and _call_tool
+    # already runs its sync client call via asyncio.to_thread, so dispatching
+    # every batch concurrently via asyncio.gather is real concurrency, not
+    # just async syntax — this was previously a sequential for-loop awaiting
+    # one batch at a time for no reason, wasting wall-clock time on a purely
+    # IO-bound API call with no GPU/shared-resource contention to serialize.
     # ------------------------------------------------------------------
     first_pass: dict[str, dict] = {}
     all_contexts = list(contexts_by_id.values())
-    for batch in _chunk(all_contexts, _SPEAKER_BATCH_SIZE):
-        payload = {"cast": cast_payload, "turns": batch}
-        raw = await _call_tool(
+    first_pass_batches = _chunk(all_contexts, _SPEAKER_BATCH_SIZE)
+    first_pass_raws = await asyncio.gather(*[
+        _call_tool(
             client, settings.L4_GROUNDING_MODEL, GROUNDING_SPEAKER_SYSTEM_PROMPT,
-            RESOLVE_SPEAKER_TURNS_TOOL, payload, _SPEAKER_LLM_MAX_TOKENS,
+            RESOLVE_SPEAKER_TURNS_TOOL, {"cast": cast_payload, "turns": batch},
+            _SPEAKER_LLM_MAX_TOKENS,
+            pool=pool, video_id=video_id, stage="grounding_speaker",
         )
+        for batch in first_pass_batches
+    ])
+    for raw in first_pass_raws:
         if raw is None:
             continue
-        try:
-            parsed = SpeakerResolutionBatch.model_validate(raw)
-        except Exception as exc:
-            logger.error("run_speaker_resolution: failed to validate first-pass batch: %s", exc)
-            continue
-        for item in parsed.resolutions:
+        for item in _parse_resolutions_lenient(raw):
             if item.turn_id in contexts_by_id:
                 first_pass[item.turn_id] = item.model_dump()
 
@@ -363,20 +487,20 @@ async def run_speaker_resolution(pool: asyncpg.Pool, video_id: str) -> list[Spea
     escalated: dict[str, dict] = {}
     if low_conf_ids:
         low_conf_contexts = [contexts_by_id[tid] for tid in low_conf_ids]
-        for batch in _chunk(low_conf_contexts, _SPEAKER_BATCH_SIZE):
-            payload = {"cast": cast_payload, "turns": batch}
-            raw = await _call_tool(
+        escalation_batches = _chunk(low_conf_contexts, _SPEAKER_BATCH_SIZE)
+        escalation_raws = await asyncio.gather(*[
+            _call_tool(
                 client, settings.L4_STORY_ARCHITECT_MODEL, GROUNDING_SPEAKER_SYSTEM_PROMPT,
-                RESOLVE_SPEAKER_TURNS_TOOL, payload, _SPEAKER_LLM_MAX_TOKENS,
+                RESOLVE_SPEAKER_TURNS_TOOL, {"cast": cast_payload, "turns": batch},
+                _SPEAKER_LLM_MAX_TOKENS,
+                pool=pool, video_id=video_id, stage="grounding_speaker_escalation",
             )
+            for batch in escalation_batches
+        ])
+        for raw in escalation_raws:
             if raw is None:
                 continue
-            try:
-                parsed = SpeakerResolutionBatch.model_validate(raw)
-            except Exception as exc:
-                logger.error("run_speaker_resolution: failed to validate escalation batch: %s", exc)
-                continue
-            for item in parsed.resolutions:
+            for item in _parse_resolutions_lenient(raw):
                 if item.turn_id in contexts_by_id:
                     escalated[item.turn_id] = item.model_dump()
 
@@ -425,14 +549,52 @@ async def run_speaker_resolution(pool: asyncpg.Pool, video_id: str) -> list[Spea
             ))
 
     await bulk_update_speaker_turn_resolutions(pool, updates)
+    n_unresolved_final = sum(1 for r in results if r.resolution_method == "llm_unresolved_final")
     logger.info(
         "run_speaker_resolution: video_id=%s decided=%d/%d turns (tiebreak=%d, unresolved_final=%d, "
         "left_untouched=%d)",
         video_id, len(results), len(turns),
         sum(1 for r in results if r.resolution_method == "llm_tiebreak"),
-        sum(1 for r in results if r.resolution_method == "llm_unresolved_final"),
+        n_unresolved_final,
         len(turns) - len(results),
     )
+
+    # ------------------------------------------------------------------
+    # B4 observability: llm_unresolved_final rate + confidence-escalation
+    # trigger rate. Computed here (not in finalizer.py) because the
+    # escalation trigger count (`low_conf_ids`) only exists in this
+    # function's local state — nothing persists "was this turn escalated"
+    # as a column, so finalizer.py has no way to reconstruct it after the
+    # fact. Denominator is `len(turns)` (all turns this run attempted to
+    # resolve), matching the same "rate over what was processed" framing
+    # CLAUDE.md 1b uses for the OTHER-bucket check below.
+    # ------------------------------------------------------------------
+    if turns:
+        unresolved_final_rate = n_unresolved_final / len(turns)
+        if unresolved_final_rate > _UNRESOLVED_FINAL_RATE_THRESHOLD:
+            logger.warning(
+                "run_speaker_resolution: llm_unresolved_final rate is %.1f%% "
+                "for video_id=%s — signal for human review (pipeline_alerts)",
+                unresolved_final_rate * 100, video_id,
+            )
+            await insert_pipeline_alert(
+                pool, video_id, 4, "l4_llm_unresolved_final_rate",
+                unresolved_final_rate, _UNRESOLVED_FINAL_RATE_THRESHOLD,
+            )
+
+        escalation_trigger_rate = len(low_conf_ids) / len(turns)
+        if escalation_trigger_rate > _ESCALATION_TRIGGER_RATE_THRESHOLD:
+            logger.warning(
+                "run_speaker_resolution: confidence-escalation trigger rate is %.1f%% "
+                "for video_id=%s — first-pass model struggling on this video "
+                "(pipeline_alerts)",
+                escalation_trigger_rate * 100, video_id,
+            )
+            await insert_pipeline_alert(
+                pool, video_id, 4, "l4_confidence_escalation_trigger_rate",
+                escalation_trigger_rate, _ESCALATION_TRIGGER_RATE_THRESHOLD,
+            )
+
     return results
 
 
@@ -458,6 +620,13 @@ async def _embed_texts(texts: list[str]) -> list[list[float] | None]:
         from models.embed_model import LocalEmbedder
 
         embedder = LocalEmbedder.get()
+        # Real bug found on a live run: L4 runs in its own CPU-only Modal
+        # container (l4_image), separate from L3's QwenAnalyserModal, which
+        # is the only place that previously called .load() — L4's container
+        # never loaded the model at all. .load() is idempotent (no-op if
+        # already loaded), so calling it here is always safe and makes this
+        # function self-sufficient regardless of orchestration order.
+        await asyncio.to_thread(embedder.load)
         embeddings = await asyncio.to_thread(embedder.embed, texts, 64)
         return embeddings  # type: ignore[return-value]
     except Exception as exc:
@@ -530,29 +699,69 @@ async def run_relation_canonicalization(pool: asyncpg.Pool, video_id: str) -> li
     embeddings = await _embed_texts(readable)
     clusters = _cluster_by_similarity(relations, embeddings, _RELATION_CLUSTER_SIM_THRESHOLD)
 
+    # Real-video cost finding: sending every raw relation string in a
+    # cluster (some clusters have dozens of near-duplicate variants, per
+    # CLAUDE.md's own "200+ distinct relation strings observed" note)
+    # bloated single calls to 40K+ input tokens for no decision-quality
+    # benefit — the LLM only needs enough examples to recognize the
+    # pattern, not literally every variant. Cap what's SHOWN to the model;
+    # cluster_by_id below keeps the FULL list for write-back (every raw
+    # relation still gets mapped to a canonical label, just not
+    # individually shown in the prompt).
     cluster_payload = [
-        {"cluster_id": f"c{i}", "raw_relations": members} for i, members in enumerate(clusters)
+        {
+            "cluster_id": f"c{i}",
+            "raw_relations": members[:_MAX_RELATION_EXAMPLES_PER_CLUSTER],
+            "total_count": len(members),
+        }
+        for i, members in enumerate(clusters)
     ]
-    cluster_by_id = {c["cluster_id"]: c["raw_relations"] for c in cluster_payload}
+    cluster_by_id = {f"c{i}": members for i, members in enumerate(clusters)}
 
     client = _get_groq_client()
-    payload = {"clusters": cluster_payload, "ontology": ontology}
-    raw = await _call_tool(
-        client, settings.L4_GROUNDING_MODEL, GROUNDING_RELATION_SYSTEM_PROMPT,
-        CANONICALIZE_RELATIONS_TOOL, payload, _RELATION_LLM_MAX_TOKENS,
-    )
-    if raw is None:
-        logger.error("run_relation_canonicalization: LLM call failed for video_id=%s — nothing written", video_id)
-        return []
+    cluster_batches = _chunk(cluster_payload, _RELATION_BATCH_SIZE)
+    batch_raws = await asyncio.gather(*[
+        _call_tool(
+            client, settings.L4_GROUNDING_MODEL, GROUNDING_RELATION_SYSTEM_PROMPT,
+            CANONICALIZE_RELATIONS_TOOL, {"clusters": batch, "ontology": ontology},
+            _RELATION_LLM_MAX_TOKENS,
+            pool=pool, video_id=video_id, stage="grounding_relation",
+        )
+        for batch in cluster_batches
+    ])
 
-    try:
-        parsed = RelationCanonicalizationBatch.model_validate(raw)
-    except Exception as exc:
-        logger.error("run_relation_canonicalization: failed to validate response: %s", exc)
-        return []
+    parsed_results: list[RelationClusterResult] = []
+    for batch_idx, raw in enumerate(batch_raws):
+        if raw is None:
+            logger.error(
+                "run_relation_canonicalization: video_id=%s batch %d/%d LLM call failed — "
+                "its clusters default to OTHER below (safe to retry on next run)",
+                video_id, batch_idx + 1, len(cluster_batches),
+            )
+            continue
+        results_raw = raw.get("results")
+        if not isinstance(results_raw, list):
+            logger.error(
+                "run_relation_canonicalization: video_id=%s batch %d/%d 'results' missing "
+                "or not a list in tool output — nothing written for this batch: %r",
+                video_id, batch_idx + 1, len(cluster_batches), raw,
+            )
+            continue
+        for i, item_raw in enumerate(results_raw):
+            try:
+                parsed_results.append(RelationClusterResult.model_validate(item_raw))
+            except Exception as exc:
+                # Per-item, not per-batch (same fix as _parse_resolutions_lenient
+                # above) — one malformed cluster result must not discard every
+                # other cluster's canonicalization in the same batch.
+                logger.error(
+                    "run_relation_canonicalization: video_id=%s batch %d/%d dropping "
+                    "malformed result at index %d: %s | raw=%r",
+                    video_id, batch_idx + 1, len(cluster_batches), i, exc, item_raw,
+                )
 
     relation_to_canonical: dict[str, str] = {}
-    for result in parsed.results:
+    for result in parsed_results:
         canon = result.canonical_relation if result.canonical_relation in ontology_set else "OTHER"
         for raw_rel in cluster_by_id.get(result.cluster_id, []):
             relation_to_canonical[raw_rel] = canon
@@ -568,11 +777,15 @@ async def run_relation_canonicalization(pool: asyncpg.Pool, video_id: str) -> li
 
     if relation_to_canonical:
         other_frac = sum(1 for v in relation_to_canonical.values() if v == "OTHER") / len(relation_to_canonical)
-        if other_frac > 0.05:
+        if other_frac > _OTHER_BUCKET_RATE_THRESHOLD:
             logger.warning(
                 "run_relation_canonicalization: OTHER bucket is %.1f%% of distinct relations "
                 "for video_id=%s — signal to review and version the ontology (not silent decay)",
                 other_frac * 100, video_id,
+            )
+            await insert_pipeline_alert(
+                pool, video_id, 4, "l4_canonical_relation_other_rate",
+                other_frac, _OTHER_BUCKET_RATE_THRESHOLD,
             )
 
     logger.info(

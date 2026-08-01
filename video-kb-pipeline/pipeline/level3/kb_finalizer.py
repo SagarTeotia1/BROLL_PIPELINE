@@ -2,8 +2,14 @@
 
 Converts raw Qwen VL frame outputs into the full set of Level-3 KB records:
   - FrameAnalysisRecord  → postgres frame_analyses table
-  - SearchableFactRecord → postgres searchable_facts + Pinecone facts namespace
-  - KGNode / KGEdge      → postgres kg_nodes / kg_edges tables (structured cache)
+  - SearchableFactRecord → postgres searchable_facts (embedding column —
+                           pgvector cosine search, no separate vector store;
+                           B7 dropped Pinecone)
+  - KGNode / KGEdge      → postgres kg_nodes / kg_edges tables (structured
+                           cache; the "Scene" KGNode also carries the scene
+                           caption embedding — replaces the old Pinecone
+                           `scenes` namespace for L3's loose per-frame scene
+                           grouping)
   - Neo4j graph          → primary graph traversal store (Cypher queries)
 
 Text embeddings for searchable facts and scene captions are generated locally
@@ -392,14 +398,16 @@ async def finalize_level3_kb(
     persons: list[PersonRecord],
     shots: list[ShotRecord],
 ) -> None:
-    """Persist all Level-3 outputs to Postgres, Pinecone, and Neo4j.
+    """Persist all Level-3 outputs to Postgres and Neo4j (B7: no separate
+    vector store — pgvector on Postgres is the only vector index).
 
     Processing order:
     1. Collect all analyses, facts, scene captions, KG nodes from all frames
     2. Bulk-upsert frame analyses to Postgres
     3. Embed facts + scene captions in parallel (single GPU pass each)
     4. Bulk-insert searchable_facts with embeddings included (no update loop)
-    5. Upsert facts + scenes to Pinecone
+    5. Attach scene caption embeddings to the "Scene" KGNodes (in-memory,
+       before the KG node write — no separate propagation pass needed)
     6. Bulk-upsert KG nodes → build edges → bulk-insert KG edges
     7. Write Neo4j graph (background, non-blocking to caller)
     """
@@ -419,7 +427,7 @@ async def finalize_level3_kb(
         return
 
     all_facts: list[SearchableFactRecord] = []
-    scene_pinecone_records: dict[str, dict] = {}
+    scene_caption_records: dict[str, dict] = {}
     all_nodes: list[KGNode] = []
     all_analyses: list[FrameAnalysisRecord] = []
     scene_meta: dict[str, dict] = {}
@@ -443,21 +451,13 @@ async def finalize_level3_kb(
             all_facts.append(SearchableFactRecord(
                 id=fact_id, video_id=video_id, frame_id=kf.id,
                 fact_text=stripped, timestamp_s=kf.timestamp_s,
-                embedding=None, pinecone_id=fact_id,
+                embedding=None, legacy_vector_id=fact_id,
             ))
 
-        if output.scene_id and output.scene_id not in scene_pinecone_records:
-            scene_pinecone_records[output.scene_id] = {
-                "id": f"{video_id}::{output.scene_id}",
+        if output.scene_id and output.scene_id not in scene_caption_records:
+            scene_caption_records[output.scene_id] = {
                 "video_id": video_id, "scene_id": output.scene_id,
-                "caption": output.caption or "", "embedding": None,
-                "metadata": {
-                    "first_timestamp_s": kf.timestamp_s,
-                    "beat_type": output.story_beat.beat_type if output.story_beat else "",
-                    "location_id": output.location_id or "",
-                    "mood": output.emotional_tone.scene_mood if output.emotional_tone else "",
-                    "tension_level": output.emotional_tone.tension_level if output.emotional_tone else "",
-                },
+                "caption": output.caption or "",
             }
 
         if output.scene_id and output.scene_id not in scene_meta:
@@ -488,8 +488,8 @@ async def finalize_level3_kb(
     # This eliminates the per-fact update loop: embed once, insert with vectors.
     # ------------------------------------------------------------------
     fact_texts    = [f.fact_text for f in all_facts]
-    scene_list    = list(scene_pinecone_records.values())
-    scene_captions = [s["caption"] for s in scene_list]
+    scene_ids_ordered = list(scene_caption_records.keys())
+    scene_captions = [scene_caption_records[sid]["caption"] for sid in scene_ids_ordered]
 
     logger.info(
         "Embedding %d facts + %d scene captions in parallel", len(fact_texts), len(scene_captions)
@@ -516,29 +516,32 @@ async def finalize_level3_kb(
             logger.error("bulk_insert_searchable_facts failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Step 4: Pinecone upserts — facts + scenes
+    # Step 4: attach scene caption embeddings to the "Scene" KGNodes before
+    # they're written (B7 — no separate vector store; the Scene node's
+    # `embedding` column IS the searchable scene-caption vector now, queried
+    # via a cosine `<=>` search on kg_nodes.embedding, same pattern as
+    # queries.search_scenes_by_embedding uses for the canonical L4 `scenes`
+    # table). L3's Scene grouping here is the loose per-frame-alias variant;
+    # L4's Story Architect Agent builds the canonical `scenes` row/embedding
+    # separately in pipeline/level4/finalizer.py.
     # ------------------------------------------------------------------
-    from knowledge_base.pinecone_kb.indexer import upsert_facts, upsert_scenes
-
     embedded_facts = [f for f in all_facts if f.embedding is not None]
-    if embedded_facts:
-        try:
-            upserted = await asyncio.to_thread(upsert_facts, embedded_facts)
-            logger.info("Upserted %d fact vectors to Pinecone", upserted)
-        except Exception as exc:
-            logger.error("Pinecone upsert_facts failed: %s", exc)
 
-    embedded_scene_records = [
-        {**rec, "embedding": emb}
-        for rec, emb in zip(scene_list, scene_embeddings)
+    scene_embedding_map: dict[str, list[float]] = {
+        sid: emb
+        for sid, emb in zip(scene_ids_ordered, scene_embeddings)
         if emb is not None
-    ]
-    if embedded_scene_records:
-        try:
-            upserted = await asyncio.to_thread(upsert_scenes, embedded_scene_records)
-            logger.info("Upserted %d scene vectors to Pinecone", upserted)
-        except Exception as exc:
-            logger.error("Pinecone upsert_scenes failed: %s", exc)
+    }
+    if scene_embedding_map:
+        for node in all_nodes:
+            if node.node_type == "Scene" and node.ref_id in scene_embedding_map:
+                node.embedding = scene_embedding_map[node.ref_id]
+
+    logger.info(
+        "Embedded %d/%d facts, %d/%d scene captions",
+        len(embedded_facts), len(all_facts),
+        len(scene_embedding_map), len(scene_ids_ordered),
+    )
 
     # ------------------------------------------------------------------
     # Step 5: KG nodes → edges → Postgres
@@ -644,14 +647,14 @@ async def finalize_level3_kb(
 
     logger.info(
         "finalize_level3_kb complete for video_id=%s — "
-        "frames=%d facts=%d (pinecone=%d) scenes=%d (pinecone=%d) "
+        "frames=%d facts=%d (embedded=%d) scenes=%d (embedded=%d) "
         "kg_nodes=%d kg_edges=%d",
         video_id,
         len(valid_results),
         len(all_facts),
         len(embedded_facts),
-        len(scene_list),
-        len(embedded_scene_records),
+        len(scene_ids_ordered),
+        len(scene_embedding_map),
         len(all_nodes),
         len(all_edges),
     )

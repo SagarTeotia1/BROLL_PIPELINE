@@ -11,7 +11,8 @@ itself), the L4 agents write their own rows directly:
 So `run_level4` here is purely sequencing: call the Grounding Agent's three
 sub-tasks, then the Story Architect, then the finalization gate
 (`pipeline.level4.finalizer.finalize_level4`) which validates completeness,
-propagates to Neo4j/Pinecone, and flips `storylines.status` draft -> final.
+propagates to Neo4j and writes scene/storyline embeddings to Postgres
+(pgvector — B7 dropped Pinecone), and flips `storylines.status` draft -> final.
 
 Order matters: relation canonicalization / fact dedup / speaker resolution
 are independent of scene/storyline synthesis, but the finalizer's
@@ -81,8 +82,9 @@ async def run_level4(pool: asyncpg.Pool, video_id: str) -> dict:
     logger.info("[L4] Story Architect Agent complete — video_id=%s", video_id)
 
     # ------------------------------------------------------------------
-    # 3. Finalization gate — completeness checks, Neo4j/Pinecone
-    #    propagation, draft -> final flip. Always runs last.
+    # 3. Finalization gate — completeness checks, Neo4j propagation +
+    #    pgvector scene/storyline embedding writes, draft -> final flip.
+    #    Always runs last.
     # ------------------------------------------------------------------
     result = await finalize_level4(pool, video_id)
     logger.info("[L4] run_level4 complete — video_id=%s result=%s", video_id, result)

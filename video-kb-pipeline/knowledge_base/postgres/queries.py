@@ -7,30 +7,48 @@ import uuid
 import asyncpg
 
 from shared.types import (
+    BackgroundAssignmentRecord,
     ChunkRecord,
+    ClientStyleProfileRecord,
     ColorGradeRecord,
+    CorrectionEventRecord,
     CutListItemRecord,
     EditPlanRecord,
     EditPlanRevisionRecord,
+    EmphasisEffectRecord,
     FaceAppearanceRecord,
     FaceTimelineEvent,
     FrameAnalysisRecord,
+    HumanFeedbackRecord,
     KeyframeRecord,
     KGEdge,
     KGNode,
+    LayerCompositeRecord,
     LevelStatus,
     PersonRecord,
     ProcessingJob,
+    QAReportRecord,
     QwenFrameOutput,
+    SceneOverrideRecord,
     SceneRecord,
     SearchableFactRecord,
     SequenceColorAdjustmentRecord,
+    ShotMatteRecord,
     ShotRecord,
     SpeakerTurnRecord,
+    StockAssetRecord,
+    StorylineOverrideRecord,
     StorylineRecord,
     TranscriptSegment,
     VideoMeta,
 )
+
+# L7 -- EVALUATION (CLAUDE.md "PIPELINE ADDENDUM 3") additions. Kept as a
+# separate import statement (not merged into the block above) so this file
+# only ever grows via new lines, never edits to existing ones — merge-safety
+# note at the top of this module's task: another implementation effort may
+# be adding its own new functions/imports to this same file in parallel.
+from shared.types import EvaluationScoreRecord, LLMCallLogRecord  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -96,18 +114,25 @@ def _to_uuid(value: str | None) -> uuid.UUID | None:
 
 
 async def upsert_video(pool: asyncpg.Pool, meta: VideoMeta) -> str:
-    """Insert or update a video record.  Returns the row ``id``."""
+    """Insert or update a video record.  Returns the row ``id``.
+
+    ``client_id`` (migration 016_client_style_profiles.sql) is nullable end
+    to end — omitting it (``meta.client_id is None``, the dataclass
+    default) leaves it NULL, which is a fully supported "no known client"
+    state, not a migration gap.
+    """
     row = await pool.fetchrow(
         """
-        INSERT INTO videos (id, path, r2_key, duration_s, fps, width, height)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        INSERT INTO videos (id, path, r2_key, duration_s, fps, width, height, client_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (id) DO UPDATE
           SET path       = EXCLUDED.path,
               r2_key     = EXCLUDED.r2_key,
               duration_s = EXCLUDED.duration_s,
               fps        = EXCLUDED.fps,
               width      = EXCLUDED.width,
-              height     = EXCLUDED.height
+              height     = EXCLUDED.height,
+              client_id  = COALESCE(EXCLUDED.client_id, videos.client_id)
         RETURNING id
         """,
         _to_uuid(meta.id),
@@ -117,6 +142,7 @@ async def upsert_video(pool: asyncpg.Pool, meta: VideoMeta) -> str:
         meta.fps,
         meta.width,
         meta.height,
+        meta.client_id,
     )
     return str(row["id"])
 
@@ -126,7 +152,10 @@ async def get_video(pool: asyncpg.Pool, video_id: str) -> VideoMeta | None:
 
     Used by Level-6's Editing Director (`export_xml`/`render_direct`) to
     resolve `fps` and the source file reference (`r2_key` or `path`) needed
-    to build an FCPXML asset or drive the FFmpeg render.
+    to build an FCPXML asset or drive the FFmpeg render, and by L5 Pass B /
+    L6's Color Grading + Caption agents to resolve `client_id` for an
+    optional `client_style_profiles` soft-prior lookup (CLAUDE.md
+    "PIPELINE ADDENDUM 2" -> "3. Client Style Profiles").
     """
     row = await pool.fetchrow(
         "SELECT * FROM videos WHERE id = $1",
@@ -142,6 +171,7 @@ async def get_video(pool: asyncpg.Pool, video_id: str) -> VideoMeta | None:
         fps=row["fps"],
         width=row["width"],
         height=row["height"],
+        client_id=row["client_id"] if "client_id" in row else None,
     )
 
 
@@ -783,6 +813,123 @@ async def get_color_grades_for_video(
 
 
 # ---------------------------------------------------------------------------
+# Shot mattes (Level-2, A1 — background matting)
+# ---------------------------------------------------------------------------
+
+
+async def upsert_shot_matte(pool: asyncpg.Pool, matte: ShotMatteRecord) -> str:
+    """Upsert one ``shot_mattes`` row.
+
+    Conflicts on ``(shot_id, model_version)`` — not ``id`` — so re-running
+    matting for the same shot with the same model version is a true UPSERT
+    (rule 9: idempotent) rather than accumulating a new row per run.
+    """
+    row = await pool.fetchrow(
+        """
+        INSERT INTO shot_mattes
+            (id, shot_id, video_id, r2_key, model_version)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (shot_id, model_version) DO UPDATE
+          SET r2_key = EXCLUDED.r2_key
+        RETURNING id
+        """,
+        _to_uuid(matte.id),
+        _to_uuid(matte.shot_id),
+        _to_uuid(matte.video_id),
+        matte.r2_key,
+        matte.model_version,
+    )
+    return str(row["id"])
+
+
+async def bulk_upsert_shot_mattes(
+    pool: asyncpg.Pool, mattes: list[ShotMatteRecord]
+) -> None:
+    """Upsert all shot matte records in a single executemany call."""
+    if not mattes:
+        return
+    records = [
+        (
+            _to_uuid(m.id),
+            _to_uuid(m.shot_id),
+            _to_uuid(m.video_id),
+            m.r2_key,
+            m.model_version,
+        )
+        for m in mattes
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO shot_mattes
+            (id, shot_id, video_id, r2_key, model_version)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (shot_id, model_version) DO UPDATE
+          SET r2_key = EXCLUDED.r2_key
+        """,
+        records,
+    )
+
+
+async def get_shot_mattes_for_video(
+    pool: asyncpg.Pool, video_id: str
+) -> list[ShotMatteRecord]:
+    """Return all shot_mattes rows for a video."""
+    rows = await pool.fetch(
+        "SELECT * FROM shot_mattes WHERE video_id = $1",
+        _to_uuid(video_id),
+    )
+    return [
+        ShotMatteRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]),
+            shot_id=str(r["shot_id"]),
+            r2_key=r["r2_key"],
+            model_version=r["model_version"],
+        )
+        for r in rows
+    ]
+
+
+async def get_shot_mattes_for_shots(
+    pool: asyncpg.Pool, shot_ids: list[str]
+) -> dict[str, ShotMatteRecord]:
+    """Return {shot_id: ShotMatteRecord} for the given *shot_ids*.
+
+    Used by A4's `materialize_layer_composite_ops` (Level-6 Editing
+    Director) to look up the matting artifact for whichever shot a
+    `background_swap` cut_list_item's clip falls inside — targeted lookup
+    by id list rather than pulling every shot_matte for the whole video.
+    When a shot has multiple `model_version` rows (re-matted with a newer
+    model), the most recently inserted row for that shot wins (`ORDER BY
+    id DESC` — `id` is a nanoid, not time-sortable, so this is a
+    best-effort "last write wins" tiebreak, not a true recency guarantee;
+    acceptable here since `bulk_upsert_shot_mattes` already UPSERTs on
+    `(shot_id, model_version)`, so duplicates per shot only occur across
+    genuinely different model versions).
+    """
+    if not shot_ids:
+        return {}
+    uuids = [_to_uuid(sid) for sid in shot_ids]
+    rows = await pool.fetch(
+        "SELECT * FROM shot_mattes WHERE shot_id = ANY($1::uuid[])",
+        uuids,
+    )
+    result: dict[str, ShotMatteRecord] = {}
+    for r in rows:
+        shot_id = str(r["shot_id"])
+        if shot_id in result:
+            continue  # keep first seen — see docstring's tiebreak note
+        result[shot_id] = ShotMatteRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]),
+            shot_id=shot_id,
+            r2_key=r["r2_key"],
+            model_version=r["model_version"],
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Frame analyses
 # ---------------------------------------------------------------------------
 
@@ -927,19 +1074,19 @@ async def bulk_insert_searchable_facts(
             fact.fact_text,
             fact.timestamp_s,
             fact.embedding,
-            fact.pinecone_id,
+            fact.legacy_vector_id,
         )
         for fact in facts
     ]
     await pool.executemany(
         """
         INSERT INTO searchable_facts
-            (id, video_id, frame_id, fact_text, timestamp_s, embedding, pinecone_id)
+            (id, video_id, frame_id, fact_text, timestamp_s, embedding, legacy_vector_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (video_id, fact_text) DO UPDATE
           SET timestamp_s = EXCLUDED.timestamp_s,
               embedding   = EXCLUDED.embedding,
-              pinecone_id = EXCLUDED.pinecone_id
+              legacy_vector_id = EXCLUDED.legacy_vector_id
         """,
         records,
     )
@@ -976,29 +1123,30 @@ async def update_searchable_fact_embedding(
     pool: asyncpg.Pool,
     fact_id: str,
     embedding: list[float],
-    pinecone_id: str | None = None,
+    legacy_vector_id: str | None = None,
 ) -> None:
-    """Update the embedding (and optionally pinecone_id) for a searchable fact.
+    """Update the embedding for a searchable fact.
 
-    Called after OpenAI embeddings are computed so that the vector is persisted
-    back to Postgres in addition to being upserted to Pinecone.
+    Called after embeddings are (re)computed so the vector is persisted to
+    Postgres — the sole store for fact search since B7 dropped Pinecone.
 
     Args:
-        pool:        An open asyncpg connection pool.
-        fact_id:     The fact's unique identifier (nanoid string).
-        embedding:   The 1024-dim float vector to persist.
-        pinecone_id: The Pinecone vector ID used for this fact, if known.
+        pool:             An open asyncpg connection pool.
+        fact_id:          The fact's unique identifier (nanoid string).
+        embedding:        The 1024-dim float vector to persist.
+        legacy_vector_id: Optional legacy id (was the Pinecone vector id);
+            kept only for historical-row bookkeeping, no functional use.
     """
     await pool.execute(
         """
         UPDATE searchable_facts
-        SET embedding   = $2,
-            pinecone_id = COALESCE($3, pinecone_id)
+        SET embedding = $2,
+            legacy_vector_id = COALESCE($3, legacy_vector_id)
         WHERE id = $1
         """,
         _to_uuid(fact_id),
         embedding,
-        pinecone_id,
+        legacy_vector_id,
     )
 
 
@@ -1371,7 +1519,54 @@ async def get_searchable_facts_for_video(
             frame_id=str(r["frame_id"]) if r["frame_id"] else None,
             timestamp_s=r["timestamp_s"],
             embedding=_vec_to_list(r["embedding"]),
-            pinecone_id=r["pinecone_id"],
+            legacy_vector_id=r["legacy_vector_id"],
+        )
+        for r in rows
+    ]
+
+
+async def search_searchable_facts_by_embedding(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    limit: int = 10,
+    video_id: str | None = None,
+) -> list[SearchableFactRecord]:
+    """Cosine-similarity search over `searchable_facts.embedding` (B7 —
+    replaces the Pinecone `facts` namespace). `video_id` is optional so
+    callers can either scope to one video or search across all of them.
+    """
+    if video_id is not None:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM searchable_facts
+            WHERE embedding IS NOT NULL AND video_id = $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
+            """,
+            embedding,
+            _to_uuid(video_id),
+            limit,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM searchable_facts
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT $2
+            """,
+            embedding,
+            limit,
+        )
+    return [
+        SearchableFactRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]),
+            fact_text=r["fact_text"],
+            frame_id=str(r["frame_id"]) if r["frame_id"] else None,
+            timestamp_s=r["timestamp_s"],
+            embedding=_vec_to_list(r["embedding"]),
+            legacy_vector_id=r["legacy_vector_id"],
         )
         for r in rows
     ]
@@ -1492,31 +1687,75 @@ async def get_scenes_for_video(pool: asyncpg.Pool, video_id: str) -> list[SceneR
         "SELECT * FROM scenes WHERE video_id = $1 ORDER BY start_time",
         _to_uuid(video_id),
     )
-    return [
-        SceneRecord(
-            id=str(r["id"]),
-            video_id=str(r["video_id"]),
-            canonical_scene_id=r["canonical_scene_id"],
-            discarded_aliases=list(r["discarded_aliases"] or []),
-            start_time=r["start_time"],
-            end_time=r["end_time"],
-            participants=list(r["participants"] or []),
-            summary=r["summary"],
-            emotional_arc=r["emotional_arc"],
-            causal_link_to_next=r["causal_link_to_next"],
-            usability_score=r["usability_score"],
-        )
-        for r in rows
-    ]
+    return [_row_to_scene(r) for r in rows]
+
+
+async def get_scene_by_id(pool: asyncpg.Pool, scene_id: str) -> SceneRecord | None:
+    """Fetch one `scenes` row by id. Used by `pipeline/feedback/correction_logger.py`
+    to capture `original_value` before an override overwrites a field."""
+    row = await pool.fetchrow("SELECT * FROM scenes WHERE id = $1", _to_uuid(scene_id))
+    if row is None:
+        return None
+    return _row_to_scene(row)
+
+
+def _row_to_scene(r) -> SceneRecord:
+    return SceneRecord(
+        id=str(r["id"]),
+        video_id=str(r["video_id"]),
+        canonical_scene_id=r["canonical_scene_id"],
+        discarded_aliases=list(r["discarded_aliases"] or []),
+        start_time=r["start_time"],
+        end_time=r["end_time"],
+        participants=list(r["participants"] or []),
+        summary=r["summary"],
+        emotional_arc=r["emotional_arc"],
+        causal_link_to_next=r["causal_link_to_next"],
+        usability_score=r["usability_score"],
+        embedding=_vec_to_list(r["embedding"]) if "embedding" in r else None,
+    )
+
+
+async def delete_scenes_for_video(pool: asyncpg.Pool, video_id: str) -> int:
+    """Delete all `scenes` rows for *video_id* — call before a Story Architect
+    re-run writes fresh ones (see `bulk_upsert_scenes` docstring for why this
+    is required, not just a courtesy).
+
+    Real-video finding: `bulk_upsert_scenes`'s UPSERT key is
+    `(video_id, canonical_scene_id)`, and `canonical_scene_id` is derived
+    from Qwen's own per-frame `scene_id` (via `_SceneGroup.majority_scene_id`
+    in story_architect_runner.py) — exactly the unstable, non-deterministic
+    text CLAUDE.md's "Why L4 exists" section documents as the reason L4
+    exists in the first place. Across two runs of the same video (different
+    model, different temperature draw, or just LLM non-determinism), the
+    same real-world scene can get a different majority label each time, so
+    the UPSERT conflict key never matches and rows never overwrite — they
+    accumulate. Observed on video_id=97199656: ~5 near-duplicate `scenes`
+    rows all spanning the same ~127s intro segment, ~8 for a "COMING SOON"
+    segment, ~10 for a Netflix-logo segment, surviving under different
+    canonical_scene_id text from different runs. rule 15's "safe UPSERT for
+    scenes/intermediate state" was the right intent; delete-then-insert is
+    what actually delivers it, since `scenes` (unlike `storylines`) has no
+    version column to disambiguate old vs new by.
+    """
+    result = await pool.execute(
+        "DELETE FROM scenes WHERE video_id = $1::uuid", _to_uuid(video_id)
+    )
+    # asyncpg execute() returns a status string like "DELETE 43"
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 async def bulk_upsert_scenes(pool: asyncpg.Pool, scenes: list[SceneRecord]) -> None:
     """Upsert canonical scene rows, keyed on (video_id, canonical_scene_id).
 
-    Safe to call repeatedly for the same video_id (rule 9 / rule 15 —
-    scenes are UPSERT, not INSERT, so a re-run of the Story Architect Agent
-    on the same video overwrites its own prior draft output rather than
-    accumulating duplicates).
+    Callers MUST call `delete_scenes_for_video` first on a re-run — see that
+    function's docstring for why the UPSERT key alone does not make this
+    idempotent in practice (the key is derived from non-deterministic LLM
+    text, so the "overwrites its own prior draft output" claim only holds
+    within a single run, not across runs).
     """
     if not scenes:
         return
@@ -1533,6 +1772,7 @@ async def bulk_upsert_scenes(pool: asyncpg.Pool, scenes: list[SceneRecord]) -> N
             s.emotional_arc,
             s.causal_link_to_next,
             s.usability_score,
+            s.embedding,
         )
         for s in scenes
     ]
@@ -1541,8 +1781,8 @@ async def bulk_upsert_scenes(pool: asyncpg.Pool, scenes: list[SceneRecord]) -> N
         INSERT INTO scenes
             (id, video_id, canonical_scene_id, discarded_aliases, start_time,
              end_time, participants, summary, emotional_arc, causal_link_to_next,
-             usability_score)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             usability_score, embedding)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (video_id, canonical_scene_id) DO UPDATE
           SET discarded_aliases   = EXCLUDED.discarded_aliases,
               start_time          = EXCLUDED.start_time,
@@ -1551,10 +1791,62 @@ async def bulk_upsert_scenes(pool: asyncpg.Pool, scenes: list[SceneRecord]) -> N
               summary             = EXCLUDED.summary,
               emotional_arc       = EXCLUDED.emotional_arc,
               causal_link_to_next = EXCLUDED.causal_link_to_next,
-              usability_score     = EXCLUDED.usability_score
+              usability_score     = EXCLUDED.usability_score,
+              embedding           = COALESCE(EXCLUDED.embedding, scenes.embedding)
         """,
         records,
     )
+
+
+async def update_scene_embeddings(
+    pool: asyncpg.Pool, updates: list[tuple[str, list[float]]]
+) -> None:
+    """Bulk-update `scenes.embedding` for a batch of (scene_id, embedding)
+    pairs (B7 — replaces the Pinecone canonical-scenes propagation pass in
+    `pipeline/level4/finalizer.py`). Caller batches in groups of 100 (rule 8).
+    """
+    if not updates:
+        return
+    records = [(_to_uuid(scene_id), emb) for scene_id, emb in updates]
+    await pool.executemany(
+        "UPDATE scenes SET embedding = $2 WHERE id = $1",
+        records,
+    )
+
+
+async def search_scenes_by_embedding(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    limit: int = 10,
+    video_id: str | None = None,
+) -> list[SceneRecord]:
+    """Cosine-similarity search over `scenes.embedding` (B7 — replaces the
+    Pinecone `scenes` namespace's canonical-scene variant).
+    """
+    if video_id is not None:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM scenes
+            WHERE embedding IS NOT NULL AND video_id = $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
+            """,
+            embedding,
+            _to_uuid(video_id),
+            limit,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM scenes
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT $2
+            """,
+            embedding,
+            limit,
+        )
+    return [_row_to_scene(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1574,7 +1866,18 @@ def _storyline_from_row(r) -> StorylineRecord:
         synopsis=r["synopsis"],
         cast_members=(json.loads(cast_raw) if isinstance(cast_raw, str) else (cast_raw or {})),
         beats=(json.loads(beats_raw) if isinstance(beats_raw, str) else (beats_raw or [])),
+        embedding=_vec_to_list(r["embedding"]) if "embedding" in r else None,
     )
+
+
+async def get_storyline_by_id(pool: asyncpg.Pool, storyline_id: str) -> StorylineRecord | None:
+    """Fetch one `storylines` row by id. Used by
+    `pipeline/feedback/correction_logger.py` to capture `original_value`
+    before an override overwrites a field."""
+    row = await pool.fetchrow("SELECT * FROM storylines WHERE id = $1", _to_uuid(storyline_id))
+    if row is None:
+        return None
+    return _storyline_from_row(row)
 
 
 async def get_latest_storyline(pool: asyncpg.Pool, video_id: str) -> StorylineRecord | None:
@@ -1682,6 +1985,58 @@ async def get_final_storyline_for_video(pool: asyncpg.Pool, video_id: str) -> St
     if row is None:
         return None
     return _storyline_from_row(row)
+
+
+async def update_storyline_embedding(
+    pool: asyncpg.Pool, storyline_id: str, embedding: list[float]
+) -> None:
+    """Set `storylines.embedding` for one row (B7 — replaces the Pinecone
+    storyline propagation pass in `pipeline/level4/finalizer.py`; one vector
+    per video's finalized synopsis).
+    """
+    await pool.execute(
+        "UPDATE storylines SET embedding = $2 WHERE id = $1",
+        _to_uuid(storyline_id),
+        embedding,
+    )
+
+
+async def search_storylines_by_embedding(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    limit: int = 10,
+    status: str | None = "final",
+) -> list[StorylineRecord]:
+    """Cosine-similarity search over `storylines.embedding` (B7 — replaces
+    the planned Pinecone `storylines` namespace; enables cross-video plot/
+    theme search). Defaults to `status='final'` — matches the read contract
+    (L5 and any downstream search-by-plot consumer should only see finalized
+    storylines); pass `status=None` to search drafts too.
+    """
+    if status is not None:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM storylines
+            WHERE embedding IS NOT NULL AND status = $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
+            """,
+            embedding,
+            status,
+            limit,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM storylines
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT $2
+            """,
+            embedding,
+            limit,
+        )
+    return [_storyline_from_row(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1796,8 +2151,182 @@ async def insert_edit_plan_revision(pool: asyncpg.Pool, revision: EditPlanRevisi
 
 
 # ---------------------------------------------------------------------------
+# Overrides + correction events (Addendum 2, item 2 — correction feedback loop)
+#
+# insert_scene_override/insert_storyline_override are raw table writes only.
+# Callers should go through pipeline/feedback/correction_logger.py::
+# log_scene_correction()/log_storyline_correction() instead of calling these
+# directly, so every override write also gets a matching correction_events
+# row (rule 25) — these two functions exist so that logger has something to
+# call, not as a second public entry point.
+# ---------------------------------------------------------------------------
+
+
+async def insert_scene_override(pool: asyncpg.Pool, override: SceneOverrideRecord) -> str:
+    row = await pool.fetchrow(
+        """
+        INSERT INTO scene_overrides (id, scene_id, field, new_value, reason, created_by)
+        VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+        RETURNING id
+        """,
+        _to_uuid(override.id),
+        _to_uuid(override.scene_id),
+        override.field,
+        _to_json(override.new_value),
+        override.reason,
+        override.created_by,
+    )
+    return str(row["id"])
+
+
+async def insert_storyline_override(pool: asyncpg.Pool, override: StorylineOverrideRecord) -> str:
+    row = await pool.fetchrow(
+        """
+        INSERT INTO storyline_overrides (id, storyline_id, field, new_value, reason, created_by)
+        VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+        RETURNING id
+        """,
+        _to_uuid(override.id),
+        _to_uuid(override.storyline_id),
+        override.field,
+        _to_json(override.new_value),
+        override.reason,
+        override.created_by,
+    )
+    return str(row["id"])
+
+
+async def insert_correction_event(pool: asyncpg.Pool, event: CorrectionEventRecord) -> str:
+    """Insert one `correction_events` row — the corrections dataset (Addendum
+    2, item 2). Every override write and every `edit_plan_revisions` write
+    must go through `pipeline/feedback/correction_logger.py`, which calls
+    this alongside the override/revision insert (rule 25) — no code path
+    should write one without the other."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO correction_events
+            (id, video_id, level, entity_type, entity_id, field,
+             original_value, corrected_value, correction_source, reason)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10)
+        RETURNING id
+        """,
+        _to_uuid(event.id),
+        _to_uuid(event.video_id),
+        event.level,
+        event.entity_type,
+        _to_uuid(event.entity_id),
+        event.field,
+        _to_json(event.original_value),
+        _to_json(event.corrected_value),
+        event.correction_source,
+        event.reason,
+    )
+    return str(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# Client style profiles (Addendum 2, item 3 — migration 016)
+# ---------------------------------------------------------------------------
+
+
+def _row_to_client_style_profile(r) -> ClientStyleProfileRecord:
+    return ClientStyleProfileRecord(
+        id=str(r["id"]),
+        client_id=r["client_id"],
+        caption_style=_from_json(r["caption_style"]),
+        pacing_preference=r["pacing_preference"],
+        brand_colors=_from_json(r["brand_colors"]),
+        default_platform=r["default_platform"],
+        notes=r["notes"],
+    )
+
+
+async def get_client_style_profile(
+    pool: asyncpg.Pool, client_id: str
+) -> ClientStyleProfileRecord | None:
+    """Return the `client_style_profiles` row for *client_id*, or None if no
+    profile exists yet. Read-only soft-prior lookup (CLAUDE.md rule 26) —
+    callers (L5 Pass B, L6 Color Grading Agent, L6 Caption/Text Overlay
+    Agent) must treat a None result exactly like "no client system in use
+    at all", never as an error."""
+    row = await pool.fetchrow(
+        "SELECT * FROM client_style_profiles WHERE client_id = $1",
+        client_id,
+    )
+    if row is None:
+        return None
+    return _row_to_client_style_profile(row)
+
+
+async def upsert_client_style_profile(
+    pool: asyncpg.Pool, profile: ClientStyleProfileRecord
+) -> str:
+    """Insert or update the one `client_style_profiles` row for
+    `profile.client_id` (unique index, v1 — one profile per client, no
+    versioning yet). Returns the row `id`."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO client_style_profiles
+            (id, client_id, caption_style, pacing_preference, brand_colors,
+             default_platform, notes, updated_at)
+        VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7, NOW())
+        ON CONFLICT (client_id) DO UPDATE
+          SET caption_style     = EXCLUDED.caption_style,
+              pacing_preference = EXCLUDED.pacing_preference,
+              brand_colors      = EXCLUDED.brand_colors,
+              default_platform  = EXCLUDED.default_platform,
+              notes             = EXCLUDED.notes,
+              updated_at        = NOW()
+        RETURNING id
+        """,
+        _to_uuid(profile.id),
+        profile.client_id,
+        _to_json(profile.caption_style),
+        profile.pacing_preference,
+        _to_json(profile.brand_colors),
+        profile.default_platform,
+        profile.notes,
+    )
+    return str(row["id"])
+
+
+# ---------------------------------------------------------------------------
 # Cut list items (Level-6 Editing Director — deterministic snapped cut list)
 # ---------------------------------------------------------------------------
+
+
+async def delete_cut_list_items_for_edit_plan(pool: asyncpg.Pool, edit_plan_id: str) -> int:
+    """Delete all `cut_list_items` rows for *edit_plan_id* — call before a
+    fresh `run_level6` writes new ones (see `bulk_insert_cut_list_items`
+    docstring: ids are freshly generated per run via `gen_id()`, so
+    `ON CONFLICT (id) DO NOTHING` never matches a prior run's rows, and
+    "the caller's responsibility to clear stale rows" was never actually
+    implemented anywhere until this function existed).
+
+    Real-video finding, first live L6 run: without this, two calls to
+    `run_level6` for the same `edit_plan_id` (e.g. a render that failed at
+    the ffmpeg step and got retried) left the FIRST run's cut_list_items in
+    place while the SECOND run added a full new set on top — 7 real
+    SELECT_CLIP ops turned into 21 `cut_list_items` rows, and
+    `sequence_color_adjustments` (also insert-only, same ids-not-matching
+    issue) went from 14 to 22 rows including several color deltas stacked
+    onto the SAME clip. `render_direct`'s filter_complex then built a
+    filter graph over all of them, producing chains with the same
+    colortemperature/eq/colorbalance sequence applied twice — and ffmpeg's
+    filtergraph parser ran out of memory trying to execute it
+    ("Cannot allocate memory"). `sequence_color_adjustments`,
+    `emphasis_effects`, and `layer_composites` all have
+    `ON DELETE CASCADE` from `cut_list_items` (migrations 007/010/011), so
+    deleting here alone clears every downstream L6 output table too — no
+    separate delete needed for those three.
+    """
+    result = await pool.execute(
+        "DELETE FROM cut_list_items WHERE edit_plan_id = $1::uuid", _to_uuid(edit_plan_id)
+    )
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 async def bulk_insert_cut_list_items(
@@ -1805,13 +2334,11 @@ async def bulk_insert_cut_list_items(
 ) -> None:
     """Bulk-insert `cut_list_items` rows for a finalized `edit_plan`.
 
-    Follows the `bulk_insert_speaker_turns` pattern: `ON CONFLICT (id) DO
-    NOTHING` — callers generate a fresh `id` per item (see
-    `pipeline.level6.editing_director.snap_cut_points`), so a re-run that
-    reuses the same ids is a no-op rather than a duplicate row, while a
-    re-run with freshly generated ids still requires the caller to clear
-    stale rows for the edit_plan_id first if idempotent overwrite is
-    desired (mirrors the additive-only discipline used elsewhere in L6).
+    Callers MUST call `delete_cut_list_items_for_edit_plan` first on a
+    re-run — see that function's docstring for the real-video duplication
+    bug this fixes (the `ON CONFLICT (id) DO NOTHING` clause below is not,
+    by itself, enough for idempotency: freshly generated ids never conflict
+    with a prior run's rows).
     """
     if not items:
         return
@@ -1957,3 +2484,941 @@ async def count_unterminal_speaker_turns(pool: asyncpg.Pool, video_id: str) -> i
         _to_uuid(video_id),
     )
     return int(row["n"]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Stock assets (A2 — knowledge_base/stock_assets/, standalone infrastructure,
+# built once, queried later by L6's Compositing Agent). See CLAUDE.md
+# "PIPELINE ADDENDUM" → A2.
+# ---------------------------------------------------------------------------
+
+
+async def upsert_stock_asset(pool: asyncpg.Pool, asset: StockAssetRecord) -> str:
+    """Insert or update one `stock_assets` row.  Returns the row ``id``."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO stock_assets
+            (id, source, external_id, description, tags, license_type,
+             embedding, r2_cache_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO UPDATE
+          SET source        = EXCLUDED.source,
+              external_id   = EXCLUDED.external_id,
+              description   = EXCLUDED.description,
+              tags          = EXCLUDED.tags,
+              license_type  = EXCLUDED.license_type,
+              embedding     = EXCLUDED.embedding,
+              r2_cache_key  = EXCLUDED.r2_cache_key
+        RETURNING id
+        """,
+        _to_uuid(asset.id),
+        asset.source,
+        asset.external_id,
+        asset.description,
+        asset.tags,
+        asset.license_type,
+        asset.embedding,
+        asset.r2_cache_key,
+    )
+    return str(row["id"])
+
+
+async def bulk_upsert_stock_assets(
+    pool: asyncpg.Pool, assets: list[StockAssetRecord]
+) -> None:
+    """Upsert `stock_assets` rows via `executemany`, batched in groups of 100
+    by the caller (`knowledge_base/stock_assets/indexer.py`) — rule 8's
+    "Pinecone upserts batched in 100s" principle applied here to the
+    Postgres-only A2 subsystem (B7: no Pinecone for this new table).
+
+    Safe to call with more than 100 records — `executemany` itself does not
+    need pre-chunking to be correct, but the indexer chunks anyway to keep
+    each transaction small and to log progress per batch.
+    """
+    if not assets:
+        return
+    records = [
+        (
+            _to_uuid(a.id),
+            a.source,
+            a.external_id,
+            a.description,
+            a.tags,
+            a.license_type,
+            a.embedding,
+            a.r2_cache_key,
+        )
+        for a in assets
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO stock_assets
+            (id, source, external_id, description, tags, license_type,
+             embedding, r2_cache_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO UPDATE
+          SET source        = EXCLUDED.source,
+              external_id   = EXCLUDED.external_id,
+              description   = EXCLUDED.description,
+              tags          = EXCLUDED.tags,
+              license_type  = EXCLUDED.license_type,
+              embedding     = EXCLUDED.embedding,
+              r2_cache_key  = EXCLUDED.r2_cache_key
+        """,
+        records,
+    )
+
+
+def _row_to_stock_asset(r) -> StockAssetRecord:
+    return StockAssetRecord(
+        id=str(r["id"]),
+        source=r["source"],
+        license_type=r["license_type"],
+        external_id=r["external_id"],
+        description=r["description"],
+        tags=list(r["tags"] or []),
+        embedding=_vec_to_list(r["embedding"]),
+        r2_cache_key=r["r2_cache_key"],
+    )
+
+
+async def get_stock_asset_by_source_external_id(
+    pool: asyncpg.Pool, source: str, external_id: str
+) -> StockAssetRecord | None:
+    """Look up an existing `stock_assets` row by `(source, external_id)`.
+
+    Used by the indexer to decide whether to re-embed/re-upsert an asset
+    already ingested from a prior Pexels search (idempotent re-runs — same
+    "safe to rerun" guarantee used throughout the pipeline).
+    """
+    row = await pool.fetchrow(
+        "SELECT * FROM stock_assets WHERE source = $1 AND external_id = $2",
+        source,
+        external_id,
+    )
+    return _row_to_stock_asset(row) if row is not None else None
+
+
+async def get_stock_asset_by_id(pool: asyncpg.Pool, asset_id: str) -> StockAssetRecord | None:
+    """Look up one `stock_assets` row by its primary key.
+
+    Used at A4 render time (`pipeline/level6/editing_director.py::
+    get_compositing_render_extras`) to resolve a `background_assignments`
+    pick's `asset_id` back to its `r2_cache_key` for the actual FFmpeg
+    background-swap composite — re-checked at render time rather than
+    trusted from materialize time, since the asset could in principle have
+    been removed/re-indexed between when the Compositing Agent picked it
+    and when this edit_plan is rendered.
+    """
+    row = await pool.fetchrow(
+        "SELECT * FROM stock_assets WHERE id = $1",
+        _to_uuid(asset_id),
+    )
+    return _row_to_stock_asset(row) if row is not None else None
+
+
+async def search_stock_assets(
+    pool: asyncpg.Pool,
+    embedding: list[float],
+    limit: int = 10,
+    license_type: str | None = None,
+) -> list[StockAssetRecord]:
+    """Cosine-similarity search over `stock_assets.embedding`.
+
+    This is the entry point the L6 Compositing Agent (`background_selector.py`,
+    built separately) calls to retrieve top-k candidate stock assets for a
+    scene, before the one LLM-worthy pick. `license_type` is optional —
+    filtering is available now even though enforcement is not yet wired into
+    any calling agent (see CLAUDE.md "Before building A3: stock licensing").
+
+    Args:
+        pool: asyncpg connection pool.
+        embedding: 1024-dim query vector (BAAI/bge-large-en-v1.5), typically
+            an embedding of scene transcript + `scene_mood`/tags.
+        limit: Max number of results, ordered by ascending cosine distance
+            (closest/most similar first).
+        license_type: If given, restrict results to this exact license type.
+
+    Returns:
+        List of :class:`StockAssetRecord`, closest match first.
+    """
+    if license_type is not None:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM stock_assets
+            WHERE embedding IS NOT NULL AND license_type = $2
+            ORDER BY embedding <=> $1
+            LIMIT $3
+            """,
+            embedding,
+            license_type,
+            limit,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT * FROM stock_assets
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT $2
+            """,
+            embedding,
+            limit,
+        )
+    return [_row_to_stock_asset(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Frame analyses — scene-signal fields for a video (Level-6 Compositing
+# Agent: background_selector.py aggregates scene_mood/tags per `scenes`
+# window, emphasis_selector.py aggregates beat_type/tension_level per
+# `cut_list_items` window). Distinct from `get_frame_analyses_with_
+# timestamps_for_video` (L4, qwen_output only) — this returns the flat
+# scene-signal columns L4's Story Architect already wrote to `frame_analyses`
+# directly, no qwen_output JSON parsing needed by callers.
+# ---------------------------------------------------------------------------
+
+
+async def get_frame_analyses_fields_for_video(
+    pool: asyncpg.Pool, video_id: str
+) -> list[dict]:
+    """Return [{keyframe_id, timestamp_s, scene_id, beat_type, scene_mood,
+    tension_level, tags, caption}, ...] for a video, ordered by timestamp.
+
+    `scene_id` here is frame_analyses' own loose per-frame text label (NOT
+    the canonical `scenes.id` UUID FK) — kept only as a debugging aid for
+    callers that want to see which raw alias a frame carried; do not use it
+    to join against `scenes`, use time-range overlap instead (the whole
+    reason the canonical `scenes` table exists — see CLAUDE.md "Why L4
+    exists").
+    """
+    rows = await pool.fetch(
+        """
+        SELECT k.id AS keyframe_id, k.timestamp_s, fa.scene_id, fa.beat_type,
+               fa.scene_mood, fa.tension_level, fa.tags, fa.caption
+        FROM frame_analyses fa
+        JOIN keyframes k ON k.id = fa.keyframe_id
+        WHERE fa.video_id = $1
+        ORDER BY k.timestamp_s
+        """,
+        _to_uuid(video_id),
+    )
+    return [
+        {
+            "keyframe_id": str(r["keyframe_id"]),
+            "timestamp_s": r["timestamp_s"],
+            "scene_id": r["scene_id"],
+            "beat_type": r["beat_type"],
+            "scene_mood": r["scene_mood"],
+            "tension_level": r["tension_level"],
+            "tags": list(r["tags"] or []),
+            "caption": r["caption"],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Compositing Agent — A3 background_assignments (scene-level, L6
+# background_selector.py) + A5-decision emphasis_effects (cut-order-level,
+# L6 emphasis_selector.py). See CLAUDE.md "PIPELINE ADDENDUM" -> A3, A5 and
+# migration `010_compositing.sql`.
+# ---------------------------------------------------------------------------
+
+
+async def bulk_upsert_background_assignments(
+    pool: asyncpg.Pool, assignments: list[BackgroundAssignmentRecord]
+) -> None:
+    """Upsert `background_assignments` rows, keyed on `scene_id` (unique
+    index in `010_compositing.sql`) — a background pick is a property of
+    the scene, so re-running `run_background_selection` for a video safely
+    overwrites its own prior pick rather than accumulating duplicates
+    (rule 9/15 idempotency, same pattern as `bulk_upsert_scenes`)."""
+    if not assignments:
+        return
+    records = [
+        (
+            _to_uuid(a.id),
+            _to_uuid(a.scene_id),
+            _to_uuid(a.asset_id),
+            a.start_offset,
+            a.loop,
+            a.rationale,
+        )
+        for a in assignments
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO background_assignments
+            (id, scene_id, asset_id, start_offset, loop, rationale)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (scene_id) DO UPDATE
+          SET asset_id     = EXCLUDED.asset_id,
+              start_offset = EXCLUDED.start_offset,
+              loop         = EXCLUDED.loop,
+              rationale    = EXCLUDED.rationale
+        """,
+        records,
+    )
+
+
+async def get_background_assignments_for_video(
+    pool: asyncpg.Pool, video_id: str
+) -> list[BackgroundAssignmentRecord]:
+    """Return all `background_assignments` rows for a video's scenes,
+    joined through `scenes.video_id` (the table itself carries no
+    video_id column — a background pick is scoped to `scene_id` only)."""
+    rows = await pool.fetch(
+        """
+        SELECT ba.* FROM background_assignments ba
+        JOIN scenes s ON s.id = ba.scene_id
+        WHERE s.video_id = $1
+        """,
+        _to_uuid(video_id),
+    )
+    return [
+        BackgroundAssignmentRecord(
+            id=str(r["id"]),
+            scene_id=str(r["scene_id"]),
+            asset_id=str(r["asset_id"]),
+            start_offset=r["start_offset"],
+            loop=r["loop"],
+            rationale=r["rationale"],
+        )
+        for r in rows
+    ]
+
+
+async def bulk_insert_emphasis_effects(
+    pool: asyncpg.Pool, effects: list[EmphasisEffectRecord]
+) -> None:
+    """Insert `emphasis_effects` rows. `ON CONFLICT (id) DO NOTHING` — same
+    pattern as `bulk_insert_cut_list_items`/`bulk_insert_sequence_color_
+    adjustments`: callers generate a fresh id per row, so a rerun with new
+    ids is additive, not a true UPSERT — a caller wanting a clean re-decide
+    for an edit_plan should clear stale rows for it first (same documented
+    caveat as the color-grading table)."""
+    if not effects:
+        return
+    records = [
+        (
+            _to_uuid(e.id),
+            _to_uuid(e.cut_list_item_id),
+            e.effect_type,
+            _to_json(e.parameters),
+            e.rationale,
+        )
+        for e in effects
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO emphasis_effects
+            (id, cut_list_item_id, effect_type, parameters, rationale)
+        VALUES ($1, $2, $3, $4::jsonb, $5)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        records,
+    )
+
+
+async def get_emphasis_effects_for_edit_plan(
+    pool: asyncpg.Pool, edit_plan_id: str
+) -> list[EmphasisEffectRecord]:
+    """Return all `emphasis_effects` rows for an edit plan's cut list,
+    joined through `cut_list_items.edit_plan_id` (the table itself carries
+    no edit_plan_id column, mirroring `sequence_color_adjustments`'
+    cut_list_item_id-only keying)."""
+    rows = await pool.fetch(
+        """
+        SELECT ee.* FROM emphasis_effects ee
+        JOIN cut_list_items cli ON cli.id = ee.cut_list_item_id
+        WHERE cli.edit_plan_id = $1
+        """,
+        _to_uuid(edit_plan_id),
+    )
+    result = []
+    for r in rows:
+        params = r["parameters"]
+        result.append(
+            EmphasisEffectRecord(
+                id=str(r["id"]),
+                cut_list_item_id=str(r["cut_list_item_id"]),
+                effect_type=r["effect_type"],
+                parameters=json.loads(params) if isinstance(params, str) else (params or {}),
+                rationale=r["rationale"],
+            )
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Layer composites (A4 — Level-6 Editing Director's materialized mechanics
+# record of a LAYER_COMPOSITE render, see migration `011_layer_composites.sql`
+# and `shared/types.py::LayerCompositeRecord` for why this table exists
+# separately from `background_assignments`/`emphasis_effects`.)
+# ---------------------------------------------------------------------------
+
+
+async def bulk_upsert_layer_composites(
+    pool: asyncpg.Pool, composites: list[LayerCompositeRecord]
+) -> None:
+    """Upsert `layer_composites` rows, keyed on `(cut_list_item_id,
+    layer_type)` (unique index in `011_layer_composites.sql`) — re-running
+    `materialize_layer_composite_ops` for an edit_plan safely overwrites its
+    own prior mechanics record for the same clip+layer_type rather than
+    accumulating duplicates (rule 9/15, same idempotency pattern as
+    `bulk_upsert_background_assignments`)."""
+    if not composites:
+        return
+    records = [
+        (
+            _to_uuid(c.id),
+            _to_uuid(c.cut_list_item_id),
+            c.layer_type,
+            _to_uuid(c.source_ref) if c.source_ref else None,
+            _to_json(c.position) if c.position is not None else None,
+            c.opacity,
+            c.z_index,
+        )
+        for c in composites
+    ]
+    await pool.executemany(
+        """
+        INSERT INTO layer_composites
+            (id, cut_list_item_id, layer_type, source_ref, position, opacity, z_index)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+        ON CONFLICT (cut_list_item_id, layer_type) DO UPDATE
+          SET source_ref = EXCLUDED.source_ref,
+              position   = EXCLUDED.position,
+              opacity    = EXCLUDED.opacity,
+              z_index    = EXCLUDED.z_index
+        """,
+        records,
+    )
+
+
+async def get_layer_composites_for_edit_plan(
+    pool: asyncpg.Pool, edit_plan_id: str
+) -> list[LayerCompositeRecord]:
+    """Return all `layer_composites` rows for an edit plan's cut list,
+    joined through `cut_list_items.edit_plan_id` (mirrors
+    `get_emphasis_effects_for_edit_plan`'s join shape)."""
+    rows = await pool.fetch(
+        """
+        SELECT lc.* FROM layer_composites lc
+        JOIN cut_list_items cli ON cli.id = lc.cut_list_item_id
+        WHERE cli.edit_plan_id = $1
+        """,
+        _to_uuid(edit_plan_id),
+    )
+    result = []
+    for r in rows:
+        pos = r["position"]
+        result.append(
+            LayerCompositeRecord(
+                id=str(r["id"]),
+                cut_list_item_id=str(r["cut_list_item_id"]),
+                layer_type=r["layer_type"],
+                source_ref=str(r["source_ref"]) if r["source_ref"] else None,
+                position=json.loads(pos) if isinstance(pos, str) else pos,
+                opacity=r["opacity"],
+                z_index=r["z_index"],
+            )
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pipeline alerts (CLAUDE.md "PART B — Hardening (resolved decisions)" -> B4
+# "Observability beyond the OTHER-bucket alert"). Shared, level-agnostic
+# table — see migrations/013_pipeline_alerts.sql for the DDL and rationale
+# for NOT upserting (alerts are append-only events, not decision state).
+# ---------------------------------------------------------------------------
+
+
+async def insert_pipeline_alert(
+    pool: asyncpg.Pool,
+    video_id: str,
+    level: int,
+    alert_type: str,
+    value: float | None,
+    threshold: float | None,
+) -> str:
+    """Insert one `pipeline_alerts` row. Returns the new row's `id`.
+
+    Called by a level's finalizer/updater when a threshold trips (B4's
+    table: L2 pyannote failure rate, L4 `llm_unresolved_final` rate, L4
+    confidence-escalation trigger rate, L4 `canonical_relation='OTHER'`
+    rate). Never raises for "no alert needed" — callers only call this once
+    they've already decided the threshold tripped; this function just
+    writes the row.
+    """
+    row = await pool.fetchrow(
+        """
+        INSERT INTO pipeline_alerts (id, video_id, level, alert_type, value, threshold)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        _to_uuid(video_id),
+        level,
+        alert_type,
+        value,
+        threshold,
+    )
+    return str(row["id"])
+
+
+# ---------------------------------------------------------------------------
+# QA reports (PIPELINE ADDENDUM 2, item 1 — pipeline/level6/qa_agent.py).
+# See migrations/015_qa_reports.sql for the DDL/rationale.
+# ---------------------------------------------------------------------------
+
+
+async def insert_qa_report(pool: asyncpg.Pool, report: QAReportRecord) -> str:
+    """Insert one `qa_reports` row. Returns the new row's `id`.
+
+    Called once per `run_qa_agent` invocation (the last step of
+    `pipeline/level6/updater.py::run_level6`) — QA never edits an existing
+    report or the edit_plan/cut_list_items it reviewed (rule 24: QA
+    reports, it doesn't edit), so this is always a fresh insert, never an
+    upsert."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO qa_reports
+            (id, edit_plan_id, video_id, status, deterministic_checks, llm_review, llm_status)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+        RETURNING id
+        """,
+        _to_uuid(report.id),
+        _to_uuid(report.edit_plan_id),
+        _to_uuid(report.video_id),
+        report.status,
+        _to_json(report.deterministic_checks),
+        report.llm_review,
+        report.llm_status,
+    )
+    return str(row["id"])
+
+
+async def get_qa_report_for_edit_plan(
+    pool: asyncpg.Pool, edit_plan_id: str
+) -> QAReportRecord | None:
+    """Return the most recent `qa_reports` row for *edit_plan_id*, or None
+    if QA has never run for this plan. Most-recent-first since a plan can
+    theoretically be QA'd more than once (e.g. a manual re-run after a
+    render fix) — `created_at DESC` picks the latest verdict."""
+    row = await pool.fetchrow(
+        """
+        SELECT * FROM qa_reports
+        WHERE edit_plan_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        _to_uuid(edit_plan_id),
+    )
+    if row is None:
+        return None
+    return QAReportRecord(
+        id=str(row["id"]),
+        edit_plan_id=str(row["edit_plan_id"]),
+        video_id=str(row["video_id"]),
+        status=row["status"],
+        deterministic_checks=(
+            json.loads(row["deterministic_checks"])
+            if isinstance(row["deterministic_checks"], str)
+            else (row["deterministic_checks"] or {})
+        ),
+        llm_review=row["llm_review"],
+        llm_status=row["llm_status"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Human feedback (PIPELINE ADDENDUM 3, LEVEL 8, item 8b — migration
+# 018_l8_human_feedback.sql). Holistic/qualitative feedback, distinct from
+# `correction_events` (field-level "this value was X, should be Y").
+# `category`/`sentiment` are closed enums (rule 28) so this is aggregatable
+# later by L9's `reward_signals` (not built here — L8 only produces the raw
+# signal). Appended per this repo's "only append to queries.py" convention
+# so concurrent additions from other in-flight work don't conflict.
+# ---------------------------------------------------------------------------
+
+
+async def insert_human_feedback(pool: asyncpg.Pool, feedback: HumanFeedbackRecord) -> str:
+    """Insert one `human_feedback` row. Returns the new row's `id`.
+
+    Called by `scripts/log_human_feedback.py` (CLI entry point — this
+    pipeline has no admin UI yet, same pattern as every other L4-L8 write
+    path). Always a fresh insert, never an upsert — each piece of feedback
+    is its own event, not a field to overwrite."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO human_feedback
+            (id, video_id, edit_plan_id, scene_id, sentiment, category,
+             free_text, rating, source)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id
+        """,
+        _to_uuid(feedback.id),
+        _to_uuid(feedback.video_id),
+        _to_uuid(feedback.edit_plan_id),
+        _to_uuid(feedback.scene_id),
+        feedback.sentiment,
+        feedback.category,
+        feedback.free_text,
+        feedback.rating,
+        feedback.source,
+    )
+    return str(row["id"])
+
+
+async def get_human_feedback_for_video(
+    pool: asyncpg.Pool, video_id: str
+) -> list[HumanFeedbackRecord]:
+    """Return all `human_feedback` rows for *video_id*, newest first."""
+    rows = await pool.fetch(
+        """
+        SELECT * FROM human_feedback
+        WHERE video_id = $1
+        ORDER BY created_at DESC
+        """,
+        _to_uuid(video_id),
+    )
+    return [
+        HumanFeedbackRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]),
+            edit_plan_id=str(r["edit_plan_id"]) if r["edit_plan_id"] else None,
+            scene_id=str(r["scene_id"]) if r["scene_id"] else None,
+            sentiment=r["sentiment"],
+            category=r["category"],
+            free_text=r["free_text"],
+            rating=r["rating"],
+            source=r["source"],
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# LEVEL 7 -- EVALUATION (CLAUDE.md "PIPELINE ADDENDUM 3" -> "LEVEL 7 --
+# EVALUATION"). See migrations/017_l7_evaluation.sql for the DDL/rationale.
+# ONLY new functions appended below this line for L7 -- nothing above this
+# point in the file was modified (merge-safety: a parallel L8/L9
+# implementation may also be appending new functions to this same file).
+# ---------------------------------------------------------------------------
+
+
+async def insert_evaluation_score(pool: asyncpg.Pool, score: EvaluationScoreRecord) -> str:
+    """Insert one `evaluation_scores` row (7b). Returns the new row's `id`.
+
+    Called once per `run_qa_agent` invocation, right after the existing
+    intent-match LLM pass, when the rubric-scoring call succeeded. Always a
+    fresh insert (same "QA reports, never edits" discipline as
+    `insert_qa_report` — rule 24/27), never an upsert."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO evaluation_scores
+            (id, qa_report_id, edit_plan_id, intent_match, narrative_coherence,
+             pacing_consistency, technical_cleanliness, rationale)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        RETURNING id
+        """,
+        _to_uuid(score.id),
+        _to_uuid(score.qa_report_id),
+        _to_uuid(score.edit_plan_id),
+        score.intent_match,
+        score.narrative_coherence,
+        score.pacing_consistency,
+        score.technical_cleanliness,
+        _to_json(score.rationale),
+    )
+    return str(row["id"])
+
+
+async def get_evaluation_score_for_qa_report(
+    pool: asyncpg.Pool, qa_report_id: str
+) -> EvaluationScoreRecord | None:
+    """Return the `evaluation_scores` row for *qa_report_id*, or None if
+    the rubric-scoring pass never ran / never succeeded for that report
+    (e.g. no OPENROUTER_API_KEY configured — same non-fatal-degrade
+    contract as the existing intent-match pass)."""
+    row = await pool.fetchrow(
+        "SELECT * FROM evaluation_scores WHERE qa_report_id = $1 ORDER BY created_at DESC LIMIT 1",
+        _to_uuid(qa_report_id),
+    )
+    if row is None:
+        return None
+    rationale = row["rationale"]
+    return EvaluationScoreRecord(
+        id=str(row["id"]),
+        qa_report_id=str(row["qa_report_id"]),
+        edit_plan_id=str(row["edit_plan_id"]),
+        intent_match=row["intent_match"],
+        narrative_coherence=row["narrative_coherence"],
+        pacing_consistency=row["pacing_consistency"],
+        technical_cleanliness=row["technical_cleanliness"],
+        rationale=json.loads(rationale) if isinstance(rationale, str) else (rationale or {}),
+    )
+
+
+async def insert_llm_call_log(
+    pool: asyncpg.Pool,
+    *,
+    video_id: str | None,
+    level: int,
+    stage: str,
+    model: str,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    cost_usd: float | None,
+    latency_ms: int | None,
+) -> str:
+    """Insert one `llm_call_log` row (7c). Returns the new row's `id`.
+
+    Called from `shared/llm_client.py::log_llm_call` right after every
+    LLM-consuming call site across L4-L6 reads its `response.usage` object
+    (the same object those call sites already log via `logger.info`) — this
+    just also persists it durably. `video_id` may be None for a call with
+    no clean single-video association; the column allows NULL."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO llm_call_log
+            (id, video_id, level, stage, model, prompt_tokens, completion_tokens,
+             cost_usd, latency_ms)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id
+        """,
+        _to_uuid(video_id),
+        level,
+        stage,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        latency_ms,
+    )
+    return str(row["id"])
+
+
+async def get_llm_call_log_for_video(pool: asyncpg.Pool, video_id: str) -> list[LLMCallLogRecord]:
+    """Return every `llm_call_log` row for *video_id*, most recent first —
+    used by the dashboard / cost audits, not by any pipeline stage itself."""
+    rows = await pool.fetch(
+        "SELECT * FROM llm_call_log WHERE video_id = $1 ORDER BY created_at DESC",
+        _to_uuid(video_id),
+    )
+    return [
+        LLMCallLogRecord(
+            id=str(r["id"]),
+            video_id=str(r["video_id"]) if r["video_id"] else None,
+            level=r["level"],
+            stage=r["stage"],
+            model=r["model"],
+            prompt_tokens=r["prompt_tokens"],
+            completion_tokens=r["completion_tokens"],
+            cost_usd=r["cost_usd"],
+            latency_ms=r["latency_ms"],
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Reward signals (PIPELINE ADDENDUM 3, LEVEL 9 -- migration
+# 019_l9_reward_signals.sql). Appended per this file's "only append, never
+# modify existing lines" convention -- `RewardSignalRecord` is imported
+# locally inside each function below instead of touching the existing
+# top-of-file import block (this file already has multiple concurrent
+# append-only editors this session; a shared top import line is exactly the
+# kind of edit that would collide).
+# ---------------------------------------------------------------------------
+
+
+async def upsert_reward_signal(
+    pool: asyncpg.Pool,
+    scope_type: str,
+    scope_key: str,
+    reward_score: float,
+    sample_count: int,
+) -> str:
+    """UPSERT one `reward_signals` row on (scope_type, scope_key) -- 9a.
+    Called by `scripts/compute_reward_signals.py`, safe to rerun. Unlike
+    `pipeline_alerts` (append-only event log), `reward_signals` is a derived
+    cache -- each call fully replaces the prior reward_score/sample_count
+    for that scope, matching "recomputed periodically" rollup semantics."""
+    row = await pool.fetchrow(
+        """
+        INSERT INTO reward_signals (id, scope_type, scope_key, reward_score, sample_count, updated_at)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
+        ON CONFLICT (scope_type, scope_key) DO UPDATE
+        SET reward_score = EXCLUDED.reward_score,
+            sample_count = EXCLUDED.sample_count,
+            updated_at = NOW()
+        RETURNING id
+        """,
+        scope_type,
+        scope_key,
+        reward_score,
+        sample_count,
+    )
+    return str(row["id"])
+
+
+async def get_reward_signals(
+    pool: asyncpg.Pool, scope_type: str | None = None
+) -> list[RewardSignalRecord]:
+    """Return `reward_signals` rows, optionally filtered by scope_type,
+    highest reward_score first. Read-only -- used by dashboards/audits and
+    by the 9b/9c call sites below (rule 29: never mutates behavior itself,
+    only informs human-reviewed downstream steps)."""
+    from shared.types import RewardSignalRecord
+
+    if scope_type is not None:
+        rows = await pool.fetch(
+            "SELECT * FROM reward_signals WHERE scope_type = $1 ORDER BY reward_score DESC",
+            scope_type,
+        )
+    else:
+        rows = await pool.fetch("SELECT * FROM reward_signals ORDER BY reward_score DESC")
+    return [
+        RewardSignalRecord(
+            id=str(r["id"]),
+            scope_type=r["scope_type"],
+            scope_key=r["scope_key"],
+            reward_score=r["reward_score"],
+            sample_count=r["sample_count"],
+        )
+        for r in rows
+    ]
+
+
+async def get_reward_signal(
+    pool: asyncpg.Pool, scope_type: str, scope_key: str
+) -> RewardSignalRecord | None:
+    """Return the single `reward_signals` row for (scope_type, scope_key),
+    or None if never computed / no underlying data. Used by 9b (client
+    few-shot gate in `story_architect_runner.py`/`planner_runner.py`) and by
+    `scripts/compute_reward_signals.py`'s own 9c alert-condition check."""
+    from shared.types import RewardSignalRecord
+
+    row = await pool.fetchrow(
+        "SELECT * FROM reward_signals WHERE scope_type = $1 AND scope_key = $2",
+        scope_type,
+        scope_key,
+    )
+    if row is None:
+        return None
+    return RewardSignalRecord(
+        id=str(row["id"]),
+        scope_type=row["scope_type"],
+        scope_key=row["scope_key"],
+        reward_score=row["reward_score"],
+        sample_count=row["sample_count"],
+    )
+
+
+async def get_all_evaluation_scores_with_video(pool: asyncpg.Pool) -> list[dict]:
+    """Return every `evaluation_scores` row joined to its `video_id` (via
+    `edit_plans`), for `scripts/compute_reward_signals.py`'s aggregation
+    pass. Each dict: {edit_plan_id, video_id, intent_match,
+    narrative_coherence, pacing_consistency, technical_cleanliness}. Read-
+    only -- does not touch `evaluation_scores`' own schema/query functions."""
+    rows = await pool.fetch(
+        """
+        SELECT es.edit_plan_id, ep.video_id, es.intent_match,
+               es.narrative_coherence, es.pacing_consistency,
+               es.technical_cleanliness
+        FROM evaluation_scores es
+        JOIN edit_plans ep ON ep.id = es.edit_plan_id
+        """
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_all_human_feedback(pool: asyncpg.Pool) -> list[dict]:
+    """Return every `human_feedback` row across all videos, for
+    `scripts/compute_reward_signals.py`'s aggregation pass. Each dict:
+    {id, video_id, edit_plan_id, sentiment, category, rating}. Read-only --
+    does not touch `human_feedback`'s own schema/query functions."""
+    rows = await pool.fetch(
+        "SELECT id, video_id, edit_plan_id, sentiment, category, rating FROM human_feedback"
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_distinct_canonical_relations_for_video(pool: asyncpg.Pool, video_id: str) -> list[str]:
+    """Return the distinct non-null `kg_edges.canonical_relation` values
+    present for *video_id*. Used by `scripts/compute_reward_signals.py` to
+    attribute a video-level evaluation/feedback contribution to every
+    canonical relation that video's knowledge graph actually used -- a
+    coarse, video-level (not scene/edge-level) attribution, documented as a
+    known simplification in the script's own module docstring."""
+    rows = await pool.fetch(
+        "SELECT DISTINCT canonical_relation FROM kg_edges "
+        "WHERE video_id = $1 AND canonical_relation IS NOT NULL",
+        _to_uuid(video_id),
+    )
+    return [r["canonical_relation"] for r in rows]
+
+
+async def get_video_ids_with_client(pool: asyncpg.Pool) -> dict[str, str]:
+    """Return {video_id: client_id} for every video with a non-null
+    `client_id` -- used by `scripts/compute_reward_signals.py` to scope
+    evaluation/feedback contributions to scope_type='client' (9a/9b)."""
+    rows = await pool.fetch("SELECT id, client_id FROM videos WHERE client_id IS NOT NULL")
+    return {str(r["id"]): r["client_id"] for r in rows}
+
+
+async def get_top_scoring_scenes_for_client(
+    pool: asyncpg.Pool, client_id: str, limit: int = 5
+) -> list[dict]:
+    """Return up to *limit* `scenes` rows (canonical_scene_id + summary +
+    emotional_arc) for videos belonging to *client_id*, ranked by that
+    scene's video's average `evaluation_scores` dimension (highest first).
+
+    This is the actual few-shot EXAMPLE content for 9b's
+    `client_style_examples` prompt field -- `reward_signals`
+    (scope_type='client') is only the gate that decides WHETHER to inject
+    examples (via `sample_count`); this query supplies what to inject.
+    Bounded per rule 23 -- callers pass limit=3-5, never unbounded."""
+    rows = await pool.fetch(
+        """
+        SELECT s.canonical_scene_id, s.summary, s.emotional_arc, ev.avg_score
+        FROM scenes s
+        JOIN videos v ON v.id = s.video_id
+        JOIN edit_plans ep ON ep.video_id = v.id
+        JOIN (
+            SELECT edit_plan_id,
+                   (COALESCE(intent_match, 0) + COALESCE(narrative_coherence, 0)
+                    + COALESCE(pacing_consistency, 0) + COALESCE(technical_cleanliness, 0)) / 4.0 AS avg_score
+            FROM evaluation_scores
+        ) ev ON ev.edit_plan_id = ep.id
+        WHERE v.client_id = $1 AND s.summary IS NOT NULL
+        ORDER BY ev.avg_score DESC
+        LIMIT $2
+        """,
+        client_id,
+        limit,
+    )
+    return [dict(r) for r in rows]
+
+# ---------------------------------------------------------------------------
+# Editor style profile learning (CLAUDE.md "PIPELINE ADDENDUM 4")
+# ---------------------------------------------------------------------------
+
+
+async def set_video_client_id(pool: asyncpg.Pool, video_id: str, client_id: str) -> None:
+    """Tag `videos.id = video_id` with `client_id` -- used by
+    `scripts/build_editor_profile.py` (Addendum 4, Phase 1) so that every
+    exemplar video an editor supplies for style-profile extraction is
+    attributed to that client, which is what makes L9's `compute_reward_
+    signals.py` (`scope_type='client'`) and 9b's few-shot injection able to
+    scope by `client_id` for future edits of that same video, and future
+    videos tagged with the same `client_id`, downstream. Idempotent --
+    re-running with the same (video_id, client_id) is a no-op UPDATE."""
+    await pool.execute(
+        "UPDATE videos SET client_id = $1 WHERE id = $2",
+        client_id,
+        _to_uuid(video_id),
+    )

@@ -5,9 +5,6 @@ Modal dashboard (https://modal.com/secrets) containing ALL environment
 variables that the pipeline needs:
 
     DATABASE_URL            postgresql+asyncpg://user:pass@host:5432/dbname
-    PINECONE_API_KEY        ...
-    PINECONE_INDEX_NAME     video-kb
-    PINECONE_ENVIRONMENT    us-east-1
     R2_ENDPOINT_URL         https://<account>.r2.cloudflarestorage.com
     R2_ACCESS_KEY_ID        ...
     R2_SECRET_ACCESS_KEY    ...
@@ -83,7 +80,6 @@ _SIBLING_ROOT = _THIS_DIR.parent.resolve()
 _BASE_PKGS = [
     "asyncpg>=0.29",
     "pgvector>=0.3",
-    "pinecone>=3.0",
     "boto3>=1.35",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
@@ -198,6 +194,13 @@ face_color_image = (
     .add_local_dir(str(_SIBLING_ROOT / "face_analysis-model"), remote_path="/app_modules/face_analysis", ignore=[".git"])
     .add_local_dir(str(_SIBLING_ROOT / "color-grading"), remote_path="/app_modules/color_grading", ignore=[".git"])
 )
+# NOTE (A1 — background matting, pipeline/level2/matting_runner.py):
+# this image already has everything RVM (Robust Video Matting, loaded via
+# torch.hub) needs — torch/torchvision (pinned above), opencv-python-headless
+# (_BASE_PKGS), and TORCH_HOME already pointed at the persistent /vol/models
+# volume so torch.hub's repo+checkpoint download is cached across runs, not
+# re-fetched per video. No new pip deps required; matting runs in this same
+# image as an additional parallel thread in run_level2_modal below.
 
 # Qwen / vLLM + local embedder
 # Start from CUDA 12.4 base — avoids pip pulling nvidia-cublas-cu13 (CUDA 13)
@@ -246,7 +249,8 @@ l4_image = (
         extra_index_url="https://download.pytorch.org/whl/cpu",
     )
     .pip_install([
-        "groq>=0.11",
+        "openai>=1.50",  # L4-L6 reasoning calls via OpenRouter — see shared/llm_client.py
+        "groq>=0.11",  # optional fallback provider, not used by default
         "sentence-transformers>=3.0,<4.0",  # matches qwen_image's pin — avoids torchcodec pull
     ])
     .env({
@@ -288,7 +292,7 @@ def _warmup_l1_models() -> None:
 
 
 @app.function(
-    gpu="A100",
+    gpu="A100-80GB",
     image=qwen_image,
     timeout=7200,
     volumes=_ALL_VOLUMES,
@@ -471,6 +475,7 @@ def run_level2_modal(
     cast_db_r2_key: str | None = None,
     cast_list: list[dict] | None = None,
     keyframe_timestamps: list[float] | None = None,
+    run_matting: bool = False,
 ) -> dict:
     """Run Level-2 face analysis and color grading.
 
@@ -491,6 +496,12 @@ def run_level2_modal(
         cast_list:            Inline cast — [{"name": "Alice", "images": ["https://..."]}].
         keyframe_timestamps:  Timestamps (s) of ASHFS keyframes — face appearances are
                               sampled at these points so L3 cross-reference is exact.
+        run_matting:          A1 background matting is expensive (per-shot, near-native-fps
+                              recurrent inference) and only useful when an edit plan will
+                              actually need background swap/PiP compositing (Addendum 1,
+                              A3/A4) — nothing this early in the pipeline knows that yet, so
+                              it defaults to False (skipped) rather than running unconditionally
+                              on every video. Pass True explicitly when compositing is needed.
 
     Returns:
         Dict with keys "persons", "appearances", "timeline_events", "color_grades",
@@ -508,6 +519,7 @@ def run_level2_modal(
 
     from pipeline.level2.face_runner import run_face_analysis  # type: ignore[import]
     from pipeline.level2.color_runner import run_color_grading  # type: ignore[import]
+    from pipeline.level2.matting_runner import run_background_matting  # type: ignore[import]
     from pipeline.level2.diarization_runner import run_diarization  # type: ignore[import]
     from pipeline.level2.fusion import fuse_diarization_with_faces  # type: ignore[import]
     from shared.types import ShotRecord  # type: ignore[import]
@@ -589,16 +601,20 @@ def run_level2_modal(
     except ImportError:
         pass
 
-    # Face (GPU bursts), color grading (pure CPU), and diarization (audio-only,
-    # short GPU burst) have zero resource conflict. Run all three in parallel
-    # threads → wall clock = max(face, color, diarization) not sum.
+    # Face (GPU bursts), color grading (pure CPU), diarization (audio-only,
+    # short GPU burst), and background matting (A1 — GPU, per-shot, no
+    # cut-order dependency so it has no ordering requirement relative to
+    # color grading) have zero resource conflict. Run all four in parallel
+    # threads → wall clock = max(face, color, diarization, matting) not sum.
     import concurrent.futures as _cf
     face_exc: BaseException | None = None
     color_exc: BaseException | None = None
     diar_exc: BaseException | None = None
+    matte_exc: BaseException | None = None
     face_result: dict = {}
     color_result: list = []
     diar_turns: list[dict] = []
+    matte_result: list = []
 
     def _run_face():
         nonlocal face_exc
@@ -641,15 +657,41 @@ def run_level2_modal(
             logger.warning("Diarization failed for video_id=%s (non-fatal): %s", video_id, exc)
             return []
 
-    logger.info("run_level2_modal: face + color + diarization in parallel for video_id=%s", video_id)
+    def _run_matting():
+        nonlocal matte_exc
+        if not run_matting:
+            logger.info(
+                "run_level2_modal: skipping background matting for video_id=%s "
+                "(run_matting=False — opt-in only, no compositing need known yet)",
+                video_id,
+            )
+            l2_inner_timer.record("matting", 0.0)
+            return []
+        try:
+            t0 = _t.perf_counter()
+            result = run_background_matting(video_path, video_id, shots)
+            l2_inner_timer.record("matting", _t.perf_counter() - t0)
+            return result
+        except Exception as exc:
+            # Non-fatal — A1 is a new, unproven stage; never block L2 on it.
+            matte_exc = exc
+            logger.warning("Background matting failed for video_id=%s (non-fatal): %s", video_id, exc)
+            return []
+
+    logger.info(
+        "run_level2_modal: face + color + diarization + matting in parallel for video_id=%s",
+        video_id,
+    )
     try:
-        with _cf.ThreadPoolExecutor(max_workers=3) as _pool:
+        with _cf.ThreadPoolExecutor(max_workers=4) as _pool:
             _face_fut = _pool.submit(_run_face)
             _color_fut = _pool.submit(_run_color)
             _diar_fut = _pool.submit(_run_diarization)
+            _matte_fut = _pool.submit(_run_matting)
             face_result = _face_fut.result()
             color_result = _color_fut.result()
             diar_turns = _diar_fut.result()
+            matte_result = _matte_fut.result()
     finally:
         if cast_db_tmp:
             # Remove both .db and .pkl sidecar — build_cast_db_from_cast_list
@@ -667,12 +709,14 @@ def run_level2_modal(
 
     _l2_inner = l2_inner_timer.summary()
     logger.info(
-        "run_level2_modal complete in %.0fs: persons=%d appearances=%d timeline=%d color=%d speaker_turns=%d | timings=%s",
+        "run_level2_modal complete in %.0fs: persons=%d appearances=%d timeline=%d color=%d "
+        "shot_mattes=%d speaker_turns=%d | timings=%s",
         _l2_inner["total_s"],
         len(face_result["persons"]),
         len(face_result["appearances"]),
         len(face_result["timeline_events"]),
         len(color_result),
+        len(matte_result),
         len(speaker_turns),
         _l2_inner["steps"],
     )
@@ -682,6 +726,7 @@ def run_level2_modal(
         "appearances": [dataclasses.asdict(a) for a in face_result["appearances"]],
         "timeline_events": [dataclasses.asdict(e) for e in face_result["timeline_events"]],
         "color_grades": [dataclasses.asdict(c) for c in color_result],
+        "shot_mattes": [dataclasses.asdict(m) for m in matte_result],
         "speaker_turns": [dataclasses.asdict(s) for s in speaker_turns],
         "timings": _l2_inner["steps"],
     }
@@ -693,7 +738,7 @@ def run_level2_modal(
 
 
 @app.cls(
-    gpu="A100",
+    gpu="A100-80GB",
     image=qwen_image,
     timeout=14400,
     secrets=[modal.Secret.from_name("video-kb-secrets")],
@@ -788,12 +833,12 @@ class QwenAnalyserModal:
         )
 
         # Skip Qwen if all keyframes already have frame_analyses in DB.
-        # This happens when re-running L3 to fix Pinecone/Neo4j without re-inferencing.
+        # This happens when re-running L3 to fix embeddings/Neo4j without re-inferencing.
         existing_analyses = await get_existing_frame_analyses(pool, [kf.id for kf in keyframes])
         if len(existing_analyses) == len(keyframes):
             logger.info(
                 "Shard %d/%d: all %d keyframes already analysed — skipping Qwen, "
-                "loading from DB for Pinecone/Neo4j write",
+                "loading from DB for Postgres/Neo4j write",
                 shard_index + 1, total_shards, len(keyframes),
             )
             kf_map = {kf.id: kf for kf in keyframes}
@@ -895,11 +940,13 @@ async def run_full_pipeline(
     cast_db_r2_key: str | None = None,
     cast_list: list[dict] | None = None,
     stop_after: int = 4,
+    run_matting: bool = False,
 ) -> dict:
     """Entry point: run the full L1 → L2 → L3 → L4 pipeline on Modal.
 
-    Coordinates level functions, writes all results to PostgreSQL + Pinecone
-    (+ Neo4j, + Groq API for L4 reasoning).
+    Coordinates level functions, writes all results to PostgreSQL
+    (+ Neo4j, + Groq API for L4 reasoning). All vector search is pgvector on
+    PostgreSQL — no separate vector database (B7 dropped Pinecone).
 
     Args:
         stop_after: Stop after this level (1, 2, 3, or 4). Default 4 = full pipeline.
@@ -952,6 +999,7 @@ async def run_full_pipeline(
         FaceAppearanceRecord,
         FaceTimelineEvent,
         ColorGradeRecord,
+        ShotMatteRecord,
         SpeakerTurnRecord,
     )
     from shared.utils import frame_to_png_bytes  # type: ignore[import]
@@ -1214,7 +1262,7 @@ async def run_full_pipeline(
             _t2 = _t.perf_counter()
             l2_result = await run_level2_modal.remote.aio(
                 staged_video_path, video_id, shots_data, cast_db_r2_key, cast_list,
-                kf_timestamps,
+                kf_timestamps, run_matting,
             )
             l2_timer.record("face_and_color", _t.perf_counter() - _t2)
             for k, v in (l2_result.get("timings") or {}).items():
@@ -1283,13 +1331,23 @@ async def run_full_pipeline(
                 )
                 for t in l2_result.get("speaker_turns", [])
             ]
+            shot_mattes = [
+                ShotMatteRecord(
+                    id=m["id"],
+                    video_id=m["video_id"],
+                    shot_id=m["shot_id"],
+                    r2_key=m["r2_key"],
+                    model_version=m["model_version"],
+                )
+                for m in l2_result.get("shot_mattes", [])
+            ]
 
             from pipeline.level2.updater import write_level2_to_kb  # type: ignore[import]
 
             with l2_timer.step("db_write"):
                 await write_level2_to_kb(
                     pool, video_id, persons, appearances, timeline_events, color_grades,
-                    speaker_turns,
+                    speaker_turns, shot_mattes,
                 )
 
             await update_job_status(pool, video_id, 2, LevelStatus.DONE)
@@ -1300,11 +1358,13 @@ async def run_full_pipeline(
                 "appearances": len(appearances),
                 "timeline_events": len(timeline_events),
                 "color_grades": len(color_grades),
+                "shot_mattes": len(shot_mattes),
                 "speaker_turns": len(speaker_turns),
             })
             logger.info(
-                "[L2] Complete: persons=%d appearances=%d timeline=%d color=%d speaker_turns=%d",
-                len(persons), len(appearances), len(timeline_events), len(color_grades), len(speaker_turns),
+                "[L2] Complete: persons=%d appearances=%d timeline=%d color=%d shot_mattes=%d speaker_turns=%d",
+                len(persons), len(appearances), len(timeline_events), len(color_grades),
+                len(shot_mattes), len(speaker_turns),
             )
             l2_timer.log(logger, f"L2 — Face + Color grading  (video_id={video_id[:8]})")
 
@@ -1513,6 +1573,7 @@ def main(
     input_json: str,
     video_id: str = "",
     stop_after: int = 4,
+    run_matting: bool = False,
 ) -> None:
     """Run the full pipeline from a local terminal using a single input JSON file.
 
@@ -1520,6 +1581,9 @@ def main(
 
         modal run modal_app.py --input-json input.json
         modal run modal_app.py --input-json input.json --video-id my-stable-id
+        modal run modal_app.py --input-json input.json --run-matting  (only if this
+            video will actually need background swap/PiP compositing later — A1
+            matting is expensive and skipped by default, see run_level2_modal docstring)
 
     Input JSON format::
 
@@ -1576,6 +1640,7 @@ def main(
         None,       # cast_db_r2_key — not used when cast_list provided
         cast_list,
         stop_after,
+        run_matting,
     )
     print(result)
     if result.get("video_id"):

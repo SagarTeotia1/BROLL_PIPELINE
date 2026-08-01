@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.9">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p25" frameDuration="1/25s" width="1920" height="1080"/>
+    <asset id="r2" name="input%20video" src="https://r2.sagarteotia.in/input%20video.mp4" start="0/1s" duration="3628/25s" hasVideo="1" hasAudio="1" format="r1"/>
+  </resources>
+  <library>
+    <event name="Video KB Pipeline">
+      <project name="edit_plan_b276be9d-c803-4cba-b86e-e3da624c479f">
+        <sequence format="r1" duration="3285/25s" tcStart="0/1s" tcFormat="NDF">
+          <spine>
+            <asset-clip name="cut_0_op_001" ref="r2" offset="0/25s" start="3282/25s" duration="9/25s"/>
+            <asset-clip name="cut_1_op_002" ref="r2" offset="9/25s" start="3291/25s" duration="12/25s"/>
+            <asset-clip name="cut_2_op_003" ref="r2" offset="21/25s" start="3303/25s" duration="21/25s"/>
+            <asset-clip name="cut_3_op_004" ref="r2" offset="42/25s" start="3273/25s" duration="9/25s"/>
+            <asset-clip name="cut_4_op_005" ref="r2" offset="51/25s" start="3186/25s" duration="38/25s"/>
+            <asset-clip name="cut_5_op_006" ref="r2" offset="89/25s" start="0/25s" duration="3186/25s"/>
+            <asset-clip name="cut_6_op_007" ref="r2" offset="3276/25s" start="3282/25s" duration="9/25s"/>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>

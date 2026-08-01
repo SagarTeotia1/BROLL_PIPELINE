@@ -67,6 +67,19 @@ specific to this line.
 
 Input:
   platform: reel | full_cut | youtube | ... or null
+  client_style_prior: OPTIONAL. Present only when this video's client has \
+a saved style profile with `caption_style` on file (CLAUDE.md "PIPELINE \
+ADDENDUM 2" -> "3. Client Style Profiles") — an object that may contain \
+hints such as preferred font size, position, or karaoke-vs-static timing \
+this client has favored before. Null whenever no such profile exists, \
+which is the common case and must change nothing about how you style. \
+THIS IS A SOFT PRIOR, NEVER A HARD CONSTRAINT (rule 26): use it only to \
+break otherwise-close style calls in this client's favored direction. It \
+never overrides the platform- and line-appropriate choice described above \
+(e.g. do not force karaoke_word_by_word on a long full_cut line just \
+because a profile prefers karaoke elsewhere), and it NEVER changes `text` \
+— caption text is always the unaltered transcript_text, regardless of any \
+client preference.
   captions: [
     {op_id, transcript_text, start_time, end_time}, ...
   ]

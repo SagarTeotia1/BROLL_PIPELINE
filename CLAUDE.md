@@ -1,12 +1,86 @@
 # VIDEO UNDERSTANDING PIPELINE — COMPLETE PLAN
 
-## STATUS: AWAITING USER REVIEW — DO NOT IMPLEMENT YET
+## STATUS: L1-L9 IMPLEMENTED — L1-L6 VERIFIED END-TO-END ON REAL DATA, L7-L9 VERIFIED AGAINST LIVE DB
+
+Superseded from the original "AWAITING USER REVIEW — DO NOT IMPLEMENT YET" —
+that was true when this doc was first written; it stopped being true partway
+through this project's life. See "IMPLEMENTATION STATUS SNAPSHOT" immediately
+below for the real, current, per-level state (what's built, what's verified,
+what model runs where, what's still a known gap) as of **2026-07-31**. The
+rest of this document (architecture, schemas, prompts, engineering rules) is
+still the accurate design reference — this snapshot is the "where are we
+against that design, for real" answer, kept at the top so it's the first
+thing read, not buried after 2000+ lines of design history.
+
+---
+
+## IMPLEMENTATION STATUS SNAPSHOT (2026-07-31)
+
+### Per-level status
+
+| Level | What it does | Code status | Verified how |
+|---|---|---|---|
+| **L1** | ASHFS keyframe sampling + Whisper transcript | Implemented | Real Modal runs — `processing_jobs`: 11 `done`, 1 `failed` across 12 real videos |
+| **L2** | Face (ArcFace/HSEmotion/ByteTrack) + Color (45-param) + Speaker diarization (pyannote) + matting | Implemented | Real Modal runs — 6 `done`, 5 `failed` (pyannote/HF_TOKEN issues are the common failure, non-fatal by design) |
+| **L3** | Qwen3-VL frame analysis + knowledge graph build (Postgres + Neo4j) | Implemented | Real Modal runs — 2 `done`, 2 `failed` |
+| **L4** | Grounding Agent (speaker resolution, relation canon, fact dedup) + Story Architect Agent (scenes, storyline) | Implemented | Run live multiple times this session on video `97199656`; real bugs found+fixed: cross-run scene accumulation, empty fallback summaries starving L5 relevance scoring |
+| **L5** | Selection (Pass A) + Sequencing (Pass B) + duration enforcement + validation | Implemented | Run live multiple times this session; real bugs found+fixed: whole-plan rejection on one incomplete field, `user_prompt` never reaching the sequencing pass, whole-plan rejection on one malformed op |
+| **L6** | Editing Director (cuts/XML/render) + Color Grading + Caption/Text Overlay + Compositing (A3/A5) + Audio Sync + QA Agent | Implemented | **Real render produced and verified**: `out.mp4`, 63.1MB, 131.5s, 1920×1080 h264/aac, zero decode errors full-file scan. Real bugs found+fixed: Compositing Agent crash (uncaught missing dep) taking down the whole render, `cut_list_items`/color-adjustment accumulation across reruns, cut-snapping collapsing to one wrong shared timestamp, ffmpeg `Cannot allocate memory` on reordered clips (shared-decode filter_complex → per-clip extraction + concat-demuxer rewrite) |
+| **L7** | Evaluation — golden-set test, rubric scoring, cost/latency tracking, alerts panel | Implemented | Real DB rows: `evaluation_scores` (1), `llm_call_log` (1); `tests/integration/test_e2e_golden.py` 7/7 passing |
+| **L8** | Human Feedback — `human_feedback` table + fixed dead L4 correction entry point | Implemented | Real DB rows: `human_feedback` (2), real `correction_events`/`scene_overrides` rows proving the previously-dead `log_scene_correction` now works |
+| **L9** | Reward/Punishment — `reward_signals` aggregation, few-shot injection (L4/L5), negative-reward alert trigger | Implemented | Real DB rows: `reward_signals` (21), idempotent rerun confirmed. 9b/9c wired correctly but **not yet live-firing** — no video has `client_id` populated yet (9b), no relation has crossed the negative-reward+sample-count threshold yet (9c) |
+
+Full test suite: **183/183 passing** (`pytest tests/`) — includes fixing all 6 pre-existing failures an audit found (5 stale test fixtures, 1 test asserting behavior a real bug fix intentionally changed), not just avoiding new ones.
+
+### Model-per-level (what actually calls what, today)
+
+| Level | Component | Model | Provider | Notes |
+|---|---|---|---|---|
+| L1 | ASHFS keyframes | — | local (DINOv2 + PySceneDetect) | no LLM |
+| L1 | Transcript | `large-v3` | local (faster-whisper) | no LLM |
+| L2 | Face | ArcFace + HSEmotion + ByteTrack | local (ONNX) | no LLM |
+| L2 | Color | — | local (OpenCV/CuPy, 45-param deterministic) | no LLM |
+| L2 | Diarization | `pyannote/speaker-diarization-3.1` | local (gated HF model) | no LLM |
+| L3 | Frame analysis + graph extraction | `Qwen/Qwen3-VL-8B-Instruct` | self-hosted vLLM on Modal (L40S/A100) | no external API |
+| L4 | Grounding Agent (1a speaker, 1b relation, 1c fact dedup) | `deepseek/deepseek-v3.2` | OpenRouter | `reasoning.enabled=False` — closed-set classification, no benefit from reasoning |
+| L4 | Story Architect Agent | `deepseek/deepseek-v3.2` | OpenRouter | `reasoning.enabled=True` — narrative synthesis, low call volume, worth the cost |
+| L5 | Pass A — Selection & Scoring | `qwen/qwen3-30b-a3b-instruct-2507` | OpenRouter | cheap/fast tier, high call volume |
+| L5 | Pass B — Sequencing & Pacing | `qwen/qwen3-235b-a22b-2507` | OpenRouter | strong tier, one call/video |
+| L6 | Color Grading Agent (sequence deltas) | `qwen/qwen3-30b-a3b-instruct-2507` | OpenRouter | numeric-delta reasoning, cheap tier |
+| L6 | Caption/Text Overlay Agent (style only) | `qwen/qwen3-30b-a3b-instruct-2507` | OpenRouter | text always from real transcript, never invented |
+| L6 | Compositing Agent (A3 background pick, A5 emphasis) | `qwen/qwen3-30b-a3b-instruct-2507` | OpenRouter | closed-set pick from pre-retrieved candidates |
+| L6 | QA Agent — intent-match pass | `qwen/qwen3-235b-a22b-2507` | **Groq** (not OpenRouter — a real pre-existing bug, see below) | strong tier, one call/plan |
+| L7 | QA Agent — rubric scoring (4-dim, extends QA Agent) | `qwen/qwen3-235b-a22b-2507` | OpenRouter | same model as QA intent-match, correct provider |
+| Embeddings (L3 facts/scenes, L4 relation clustering, L4 scene/storyline vectors) | — | `BAAI/bge-large-en-v1.5` | local (`sentence-transformers`) | **currently broken** — package installed but `transformers`→`tensorflow`→`protobuf` version conflict in this environment breaks the import chain; every embedding write this session degraded non-fatally to `NULL`, never blocked a run |
+| L9 | `reward_signals` computation | — | local (deterministic aggregation script) | no LLM |
+
+**Known model-routing bug, found but not yet fixed**: L6's QA Agent's *existing* intent-match pass gates on `GROQ_API_KEY` even though every other L4-L6 call site (including this session's new L7 rubric-scoring pass, same file) uses the OpenRouter client. Since most environments only have `OPENROUTER_API_KEY` set, the intent-match pass silently no-ops (`llm_status=NULL`) while the deterministic checks + new rubric pass still run fine. Left untouched by the L7 implementation per its "extend, don't replace" scope — worth a one-line fix (swap the gate to `OPENROUTER_API_KEY`, same as its own new sibling call) next time someone's in that file.
+
+### Real data in the live DB right now (Neon Postgres, `DATABASE_URL` in `.env`)
+
+`videos`=12, `scenes`=15, `storylines`=3, `edit_plans`=4, `cut_list_items`=7, `qa_reports`=2, `evaluation_scores`=1, `llm_call_log`=1, `human_feedback`=2, `reward_signals`=21, `pipeline_alerts`=7. The one fully-verified end-to-end video is `video_id=97199656-d176-46aa-88b4-026670be4576` — real L1→L6 output, snapshotted as this project's first golden test fixture (`tests/fixtures/golden_97199656.json`).
+
+### What's still a known, honest gap (not hidden, not yet fixed)
+
+- **Local embeddings broken** (see table above) — real functionality loss (no `scenes.embedding`/`searchable_facts.embedding` vector search works today), not fatal to any pipeline stage.
+- **`sentence-transformers` env conflict** is the same root cause that also crashed L6's Compositing Agent before the non-fatal-catch fix — the crash is fixed, the underlying missing capability (A3 background selection) is still non-functional until the dependency conflict is resolved.
+- **QA Agent's intent-match Groq-gating bug** (above) — narrow, one-line fix, not yet applied.
+- **L9's 9b/9c are correctly wired but not yet live-firing** — need `videos.client_id` populated (9b) and more `evaluation_scores`/`human_feedback` volume (9c) before they do anything, by design (confidence floors, not a bug).
+- **Modal wiring for L5/L6 doesn't exist** — both run only as local CLI scripts (`scripts/run_l5.py`, `scripts/run_l6.py`), not as `@app.function`s. Fine for the current dev/verification stage, a real gap before this could run unattended in production.
+- **No editor has ever watched the rendered output** — every verification this session was structural (ffprobe, decode-scan, ffmpeg exit code, DB row counts, pytest). Nothing here substitutes for a human judging whether the edit is actually *good* — see this session's earlier "editor-level assessment" discussion for why that distinction matters.
 
 ---
 
 ## What We're Building
 
 A 3-level video understanding pipeline that runs on Modal.com (L40s GPU) and produces a rich, queryable knowledge base combining a PostgreSQL graph database, Pinecone vector index, and Cloudflare R2 object store.
+
+**Note (2026-07-31): this intro paragraph describes the ORIGINAL 3-level plan.**
+The pipeline grew to 9 levels (L1-L9) over this project's life — see
+"IMPLEMENTATION STATUS SNAPSHOT" above for the current shape. Pinecone was
+also dropped entirely (B7) in favor of pgvector. Left as-is below for
+historical accuracy of the original design intent, same convention this doc
+already uses for every other superseded section.
 
 Three existing production-ready modules wire together:
 - **ASHFS** (`/ashfs/`) — adaptive keyframe sampler (6-stage pipeline, DINOv2, shot detection)
@@ -347,6 +421,23 @@ CREATE INDEX ON persons USING ivfflat (arcface_embedding vector_cosine_ops) WITH
 ---
 
 ## Pinecone Namespaces
+
+### STATUS: SUPERSEDED (B7, PART B — Hardening → resolved) — Pinecone was
+dropped entirely; `knowledge_base/pinecone_kb/` deleted. All vector search
+now runs on Postgres pgvector (ivfflat indexes), consolidated as follows:
+
+| Old Pinecone namespace | Now lives at | Search entry point |
+|---|---|---|
+| `frames` (dim=768, DINOv2) | `keyframes.dino_embedding` | already pgvector — was never Pinecone-only |
+| `facts` (dim=1024) | `searchable_facts.embedding` | `knowledge_base.postgres.queries.search_searchable_facts_by_embedding` |
+| `scenes` (dim=1024) | `scenes.embedding` (canonical, L4) + `kg_nodes.embedding` (loose per-frame alias, L3) | `search_scenes_by_embedding` |
+| `persons` (dim=512, planned) | `persons.arcface_embedding` | already pgvector — was never Pinecone-only |
+| `storylines` (dim=1024, planned) | `storylines.embedding` | `search_storylines_by_embedding` |
+
+Columns/indexes added by migration `012_pgvector_only.sql`. Kept below
+unedited for historical context (matches the pattern used elsewhere in this
+doc — e.g. L1's original architecture box — of marking superseded sections
+rather than deleting them).
 
 ```
 Index name: video-kb
@@ -798,7 +889,12 @@ You assign ONE canonical relation type to each cluster of near-duplicate
 free-text relation strings extracted from one video's frame analysis.
 
 Input:
-  clusters: [{cluster_id, raw_relations: [...]}, ...]
+  clusters: [{cluster_id, raw_relations: [...] (a representative sample of
+    up to 8 near-duplicate strings from this cluster, NOT the exhaustive
+    list — every member still gets mapped to your answer, only what's shown
+    to you is capped — real-video cost finding: some clusters had dozens of
+    near-duplicate variants, bloating input tokens with no decision-quality
+    benefit), total_count (the real number of members in this cluster)}, ...]
   ontology: the current allowed canonical relations (below) — you may ONLY
     choose from this list, never invent a new one.
 
@@ -847,6 +943,9 @@ Input (one batch of 3-5 consecutive scenes, chronological):
     this batch (empty on the first batch)
   scenes: [
     {
+      scene_index: 0-based position of this scene within THIS batch — echo
+        back unchanged on the matching scene_beat so it can be matched to
+        the correct input scene.
       scene_frames: PRUNED frame_analyses for this scene — caption,
         causality, continuity, people[] (pid+story_role+action only, NOT
         full gaze/pose/clothing/apparel detail), beat_type, scene_mood,
@@ -876,6 +975,7 @@ Then, once for the whole batch:
      grow unbounded across batches.
 
 Return one scene_beat per input scene, via the write_scene_beats tool call.
+Every scene_beat MUST include the scene_index of the input scene it answers.
 ```
 
 Tool/function schema (structured output):
@@ -890,10 +990,9 @@ Tool/function schema (structured output):
         "items": {
           "type": "object",
           "properties": {
+            "scene_index": {"type": "integer"},
             "canonical_scene_id": {"type": "string"},
             "discarded_aliases": {"type": "array", "items": {"type": "string"}},
-            "start_time": {"type": "number"},
-            "end_time": {"type": "number"},
             "participants": {"type": "array", "items": {"type": "string"}},
             "summary": {"type": "string"},
             "emotional_arc": {"type": "string"},
@@ -907,6 +1006,99 @@ Tool/function schema (structured output):
   }
 }
 ```
+
+`start_time`/`end_time` deliberately absent from this schema (removed after
+a real-video finding): write-back always uses the input group's real frame
+timestamps, never the LLM's — requiring these as output fields caused
+validation failures when the model returned null for values it doesn't
+actually know, dropping entire otherwise-valid windows for zero benefit.
+
+`scene_index` added after a real-video finding (first live L4 run): the
+model sometimes returns fewer `scene_beats` than input scenes (e.g. 3
+beats for 4 scenes in one batch). The original design matched beats to
+input scenes by list position (`zip`), which silently dropped whichever
+scene got cut — a real gap in scene time coverage, contradicting the
+finalizer's own "every chunk/shot time range covered by ≥1 scenes row"
+rule. Each input scene now carries a `scene_index` (0-based position in
+its batch) that the model must echo back on its matching beat; the runner
+matches by that index instead of position. Any input scene with no
+matching beat still gets a scene row — a deterministic fallback record
+built from frame timestamps alone (`summary: "(no beat returned by story
+architect for this scene)"`, empty participants) — so time coverage is
+never gapped even when the model under-returns.
+
+Second real-video finding, same first live run, different bug: even with
+`scene_index` matching working correctly, the finalizer's coverage check
+still failed — "6 time gap(s) totalling 17.0s not covered by any `scenes`
+row (checked against shots)". Root cause: `_SceneGroup.start_time`/
+`end_time` were computed as the min/max timestamp of the group's own
+Qwen-analyzed keyframes — but keyframes are a sparse ASHFS-selected subset
+of a shot's frames, not every frame, so a scene's raw keyframe span is
+narrower than the shot(s) it actually covers. Fix: `_snap_group_boundaries()`
+(`pipeline/level4/story_architect_runner.py`), called right after grouping,
+widens each group's bounds to be contiguous with its neighbors (boundary =
+midpoint between adjacent groups' raw keyframe endpoints) and snaps the
+first/last group out to the overall min/max shot start/end fetched via
+`get_shots_for_video`. Pure widening, so it cannot invalidate anything
+already correct — `_scene_speaker_turns`' overlap matching and
+`_compute_usability_score`'s color-grade/transcript-confidence matching use
+these same bounds and only gain from a wider window, never lose data.
+
+Third finding, same audit pass: whole-window failure (LLM call failed, or
+`WriteSceneBeatsOutput` failed pydantic validation) used to `continue` with
+**zero** scene records written for every scene in that window — same
+coverage-gap class as the scene_index bug, just not closed by that fix
+(which only handles a partially-short response, not a wholly-missing one).
+Fixed by extracting `_fallback_scene_record()` and calling it for every
+group in the window on both failure paths, not just the per-scene
+missing-beat case. All three drop points (window-call-failed,
+window-validation-failed, scene-missing-from-response) now funnel through
+the same fallback, so "the model didn't answer" can never mean "this time
+range has no `scenes` row at all."
+
+Fourth finding (next live run after the above three fixes, gap shrank from
+17.0s/6 gaps to 7.4s/2 gaps but did not reach zero): `bulk_upsert_scenes`
+UPSERTs on `(video_id, canonical_scene_id)`. When two DIFFERENT, non-
+adjacent groups end up with the same canonical scene label (Qwen reusing
+scene_id strings across genuinely separate scenes is exactly the disease
+L4 exists to cure — see "Why L4 exists" above), the UPSERT silently
+overwrote one scene's row with the other's, dropping its time range even
+though `_snap_group_boundaries` had already made the *input* groups
+gap-free — the loss happened at write time, not at grouping time. Fixed
+via `_disambiguate_canonical_scene_ids()`, called right before
+`bulk_upsert_scenes` in `run_story_architect`: first occurrence of a label
+keeps it (idempotent reruns per rule 15), every later occurrence in the
+same batch gets a `__at_{start_time}s` suffix, which is always unique
+since two distinct scenes never share both bounds.
+
+Sixth finding, `grounding_runner.py` (1b, relation canonicalization) —
+recurring `Expecting ',' delimiter` malformed-JSON errors on real videos,
+worsening across reruns (OTHER-bucket rate climbing 15.5% -> 19.7% ->
+29.6%). Root cause: `run_relation_canonicalization` sent EVERY distinct
+relation cluster in ONE uncapped call — `CANONICALIZE_RELATIONS_TOOL`
+requires a `reasoning` string per cluster, and with ~150+ clusters typical
+for a video (per this doc's own "200+ distinct relation strings observed"
+note), output routinely exceeded `_RELATION_LLM_MAX_TOKENS` (4096) and got
+cut off mid-JSON — a real truncation bug wearing the same symptom as the
+"weak backend" malformed-JSON case the retry logic was built for, but not
+fixable by retrying alone (truncation recurs, just at a different random
+cutoff each time — explaining the climbing OTHER rate: whichever clusters
+got cut varied per run and silently defaulted to OTHER). This was also a
+standing violation of rule 23 (batch caps apply everywhere a list scales
+with video length) — 1b only capped `raw_relations` *shown per cluster*,
+never the cluster *count*. Fixed: `_RELATION_BATCH_SIZE = 25`, clusters
+sub-batched and dispatched concurrently via `asyncio.gather` (same pattern
+1a's `_SPEAKER_BATCH_SIZE` already used), results merged across batches
+before the OTHER-bucket / write-back step.
+
+Fifth finding, same run: `beat.participants` sometimes come back as
+`"P1 (Samay Raina)"` instead of the bare pid `"P1"` given in
+`cast_payload` keys — exact-match validation dropped every participant in
+the scene as "not in cast," even though the identity was unambiguous.
+Fixed via `_resolve_participant_pid()`: tries exact pid match, then the
+text before a `"("`, then a case-insensitive match against cast display
+names — still closed-set (rule 12), never invents a pid outside
+`cast_payload`, just tolerant of the model's formatting.
 
 Write-back: new `scenes` table (canonical, first-class — currently scenes
 only exist loosely as `kg_nodes` rows) and a `storylines` table
@@ -1077,6 +1269,13 @@ prompts/
 ```
 
 ### Neo4j + Pinecone propagation
+
+STATUS: the Pinecone half below is SUPERSEDED by B7 (see "Pinecone
+Namespaces" section) — `finalizer.py` now writes scene/storyline embeddings
+directly to `scenes.embedding`/`storylines.embedding` via
+`update_scene_embeddings`/`update_storyline_embedding` instead of calling
+`knowledge_base/pinecone_kb/indexer.py` (deleted). The Neo4j half is
+unchanged/current. Left below for historical context.
 
 L4 doesn't only write Postgres — the two systems L3 already populates need
 correction/extension passes too, or L4's cleanup never reaches the graph or
@@ -1558,3 +1757,809 @@ discipline applied throughout.
     (candidate scenes) both cap around 30-40 items/call and sub-batch.
     This is now a standing rule, not a one-off fix — apply it to any
     future stage that feeds a per-item list into one call.
+
+---
+
+## PIPELINE ADDENDUM — Motion Graphics/Compositing + Hardening
+
+### STATUS: B1/B2/B5/B6/B8 RESOLVED (doc-only, below). A1-A5 + B3/B4/B7 PLANNED, phased build in progress.
+
+### PART A — Motion Graphics / Compositing Features
+
+L1-L4 (understand + store) unchanged. New surface lands in **L2** (one new
+deterministic stage, matting) and **L6** (one new agent — Compositing Agent —
++ new `EditOperation` types the Editing Director executes).
+
+#### A1. Background matting (green screen / background removal)
+
+**Level: L2** — per-shot, parallel with Color Grading (no cut-order dependency).
+
+- New file: `pipeline/level2/matting_runner.py` — wraps RVM (Robust Video
+  Matting) or MODNet, per-shot inference
+- Modal Image: add matting model deps to L2 image build in `modal_app.py`
+- New table:
+  ```sql
+  CREATE TABLE shot_mattes (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    shot_id       UUID REFERENCES shots(id),
+    video_id      UUID REFERENCES videos(id),
+    r2_key        TEXT NOT NULL,   -- alpha-matte video or PNG sequence
+    model_version TEXT NOT NULL
+  );
+  ```
+- `pipeline/level2/updater.py` — extend to write `shot_mattes` rows alongside `color_grades`
+
+#### A2. Stock asset library + embedding index
+
+**New subsystem under `knowledge_base/`** — infrastructure, build once, query from L6.
+
+- New folder: `knowledge_base/stock_assets/`
+  - `client.py` — Pexels/Storyblocks API client (or curated internal library)
+  - `indexer.py` — embeds description/tags with `bge-large-en-v1.5` (same model
+    already used for `searchable_facts` and L4 relation clustering — no second
+    embedding model)
+- New table:
+  ```sql
+  CREATE TABLE stock_assets (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source        TEXT NOT NULL,        -- pexels | storyblocks | internal
+    external_id   TEXT,
+    description   TEXT,
+    tags          TEXT[],
+    license_type  TEXT NOT NULL,        -- see licensing note below
+    embedding     vector(1024),
+    r2_cache_key  TEXT
+  );
+  CREATE INDEX ON stock_assets USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
+  ```
+
+#### A3. Background/B-roll selection (the judgment call)
+
+**Level: L6** — new agent, same tier logic as Color Grading/Caption agents:
+retrieval cheap+deterministic, the *pick* is the one LLM-worthy step.
+
+- New file: `pipeline/level6/compositing_agent.py`
+  - submodule `background_selector.py` — embed scene transcript + `scene_mood`/
+    `tags` (already in `frame_analyses`) → top-k `stock_assets` candidates →
+    one LLM call picks + times it (loop? trim? offset?)
+- New prompt: `prompts/background_selection.py`
+- New table:
+  ```sql
+  CREATE TABLE background_assignments (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scene_id     UUID REFERENCES scenes(id),
+    asset_id     UUID REFERENCES stock_assets(id),
+    start_offset FLOAT DEFAULT 0,
+    loop         BOOLEAN DEFAULT false,
+    rationale    TEXT
+  );
+  ```
+
+#### A4. Layering/compositing mechanics (video-on-video, PiP, background swap)
+
+**Level: L6, Editing Director** — pure mechanics once A1-A3 decided *what*
+goes where. No new agent — extend the one that already turns operations into FFmpeg.
+
+- Extend `shared/types.py`: add `LAYER_COMPOSITE` to `EditOperation` enum —
+  `{base_layer, overlay_layer, position, opacity, blend_mode, z_index}`
+- Extend `pipeline/level6/editing_director.py` — new branch in XML/FFmpeg
+  writer for `LAYER_COMPOSITE` ops (`filter_complex overlay`, alpha compositing)
+- New table:
+  ```sql
+  CREATE TABLE layer_composites (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cut_list_item_id  UUID REFERENCES cut_list_items(id),
+    layer_type        TEXT NOT NULL,  -- background_swap | pip | overlay
+    source_ref        UUID,           -- background_assignments.id or another cut_list_item_id
+    position          JSONB,
+    opacity           FLOAT DEFAULT 1.0,
+    z_index           INT DEFAULT 0
+  );
+  ```
+
+#### A5. Zoom in/out and highlight/emphasis effects
+
+**Split, same pattern as A1-A4.**
+
+- **Mechanics (deterministic)** → `pipeline/level6/editing_director.py` —
+  `zoompan`/`crop` for Ken-Burns motion, overlay shapes (circle/arrow/underline)
+  for callouts. Extend `EditOperation` enum: `ZOOM_EMPHASIS {start_rect,
+  end_rect, easing, duration}`, `HIGHLIGHT_CALLOUT {shape, target_bbox,
+  start_time, duration}`
+- **Decision (what to zoom/highlight on)** → `pipeline/level6/compositing_agent.py`,
+  submodule `emphasis_selector.py` — reuses existing signal, no new data
+  collection: `beat_type`/`tension_level`/`emotion` from `frame_analyses`,
+  face bboxes from `face_appearances`. Rule-first (e.g. "zoom into speaker
+  face when tension_level spikes"), LLM only if a rule can't decide.
+- New table:
+  ```sql
+  CREATE TABLE emphasis_effects (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cut_list_item_id  UUID REFERENCES cut_list_items(id),
+    effect_type       TEXT NOT NULL,   -- zoom | highlight
+    parameters        JSONB NOT NULL,
+    rationale         TEXT
+  );
+  ```
+
+#### Updated L6 diagram
+
+```
+edit_plan (finalized)
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│  L6 — PARALLEL (all consume the same finalized edit_plan)   │
+│                                                               │
+│  Editing Director   →  cut list/XML + layer/zoom/highlight   │
+│                         op execution (mechanics)              │
+│  Compositing Agent  →  background selection + emphasis        │
+│                         selection (judgment)                  │
+│  Color Grading      →  per-shot params, sequence-aware        │
+│  Audio Sync         →  levels, ducking, multicam align         │
+│  Caption/Text Agent →  on-screen text per TEXT_OVERLAY op      │
+└────────────────────────────────────────────────────────────┘
+```
+
+Dependency: Compositing Agent's *decisions* (A3, A5) feed Editing Director's
+*execution* (A4, A5 mechanics) — same one-way relationship as L5→L6 generally.
+Matting (A1) is the one exception living in L2, not L6 — no cut-order dependency.
+
+#### Before building A3: stock licensing
+
+Confirm license tier of whichever API (Pexels/Storyblocks/etc.) actually
+covers commercial redistribution in a paid client's final delivered video —
+not just personal/internal use. `license_type` on `stock_assets` (above) lets
+this be filtered at selection time even if not enforced day one.
+
+### PART B — Hardening (resolved decisions)
+
+**B1 — Postgres vs Neo4j duality (RESOLVED).** PostgreSQL is the single
+source of truth for the knowledge graph (`kg_nodes`/`kg_edges`, plus L4's
+`scenes`/`storylines`). Neo4j is a **derived projection**, rebuilt/patched
+from Postgres state — never written to independently. This already matches
+what L4's `updater.py` does (`canonical_relation` correction pass rewrites
+Neo4j edge types from Postgres, never the reverse); stating it here removes
+any remaining ambiguity for new code. Any future Neo4j write must originate
+from a Postgres read, never the other way.
+
+**B2 — Cost & Latency Budgets.**
+
+| Level | Target cost / video-minute | Target latency / video-minute |
+|---|---|---|
+| L1 (ASHFS + Whisper) | ~$0.01 (GPU time only, no paid API) | ~15s |
+| L2 (Face + Color + Diarization) | ~$0.01 (GPU time only) | ~20s |
+| L3 (Qwen3-VL) | ~$0.03 (self-hosted vLLM, GPU time) | ~40s |
+| L4 (Grounding + Story Architect, Groq) | ~$0.02 (Groq token cost) | ~10s |
+| L5 (Planning, Groq) | ~$0.01 (Groq token cost, one-time per plan not per minute) | ~15s per plan |
+| L6 (Color/Caption/Compositing agents + render) | ~$0.01 (Groq) + render time | render-bound, not agent-bound |
+
+These are targets, not SLAs — tune after first real end-to-end run. Tracked
+per-video via `processing_jobs.meta` JSONB: every level's `updater.py`/
+`finalizer.py` writes `{cost_usd, duration_s}` into it (extends the existing
+`StepTimer` pattern already used for L1-L3 timings).
+
+**B3 — Test plan.** See `tests/` (added this pass): `tests/fixtures/` (2-3
+golden reference videos + hand-verified expected output — to be recorded),
+`tests/unit/` (cut-snapping, LUFS calc, PID remap, matting — pure functions
+per the "deterministic where possible" design principle), `tests/integration/`
+(pydantic schema-drift tests for Qwen/Groq responses — response-shape drift
+is an already-documented expected failure mode for L3/L4/L5/L6). Replaces
+the old Step 7 "spawn agents to audit" plan.
+
+**B4 — Observability beyond the OTHER-bucket alert.** Shared table:
+```sql
+CREATE TABLE pipeline_alerts (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  video_id    UUID REFERENCES videos(id),
+  level       SMALLINT NOT NULL,
+  alert_type  TEXT NOT NULL,
+  value       FLOAT,
+  threshold   FLOAT,
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
+Each level's `finalizer.py` writes a row when a threshold trips: L2 pyannote
+failure rate, L4 `llm_unresolved_final` rate, L4/L5 confidence-escalation
+trigger rate, L4 `canonical_relation = 'OTHER'` rate (already specced).
+
+**B5 — Migration/rollback strategy (RESOLVED).** Policy: every migration
+under `knowledge_base/postgres/migrations/` must be additive/backward-
+compatible (new tables/columns, nullable or defaulted — never a destructive
+`DROP`/`ALTER ... NOT NULL` against existing populated columns without a
+backfill step in the same migration). A failed migration on a live KB rolls
+back via the enclosing transaction — never partial-apply. Documented in
+`knowledge_base/postgres/migrations/README.md` (added this pass). Backfill
+note: videos processed before migration `005_kg_relation_canonical.sql` have
+`kg_edges.canonical_relation IS NULL` — L4's Grounding Agent relation-
+canonicalization step must be re-run per-video to backfill, not assumed
+retroactively populated; `finalizer.py`'s quality gate should not require
+`canonical_relation` on pre-005 videos unless they're explicitly re-run.
+
+**B6 — Cross-video scope (RESOLVED).** v1 is explicitly scoped to
+**single-video** identity — `persons.pid` (P1, P2, ...) is only stable
+*within* one video's `videos.id`, not across videos. Cross-video identity
+resolution (recognizing the same real person across two different videos)
+is **out of scope for v1**. The real mechanism, when built: `person_identities
+(id, canonical_name, embedding vector(512))` with `persons.identity_id` FK,
+resolved via `arcface_embedding` cosine similarity against
+`person_identities.embedding` at a confidence threshold, human-reviewed
+below it. Not built this pass — v-next, same as Motion Graphics Agent.
+
+**B7 — Vendor consolidation (Pinecone vs pgvector).** Deferred to end of
+phased build per suggested order (cleanup, not a blocker). When done: drop
+Pinecone, rely solely on existing `ivfflat` indexes on `searchable_facts`/
+`kg_nodes`; delete `knowledge_base/pinecone_kb/`; update `indexer.py` call
+sites in L3/L4/L5's `updater.py` files to write Postgres only.
+
+**B8 — Failure Mode Reference.**
+
+| Level | Failure | Fatal? | Retry policy | Who/what intervenes |
+|---|---|---|---|---|
+| L2 | pyannote diarization fails | No — non-fatal | None, `speaker_turns` empty for video | L4 Grounding Agent has nothing to resolve; scenes still built without speaker attribution |
+| L3 | Qwen response shape drift | No — per-frame | Reject + log, frame skipped | Manual review if skip rate high |
+| L4 | Speaker turn unresolved by both passes | No | Confidence-gated escalation: cheap pass → strong pass (bounded, 1 extra call) | Marked `llm_unresolved_final`, L5 plans around it |
+| L4 | `canonical_relation` = OTHER > 5% of video's edges | No, but alerted | None automatic | Human reviews `pipeline_alerts`, may version ontology |
+| L4 | Finalizer completeness check fails | Yes — job `FAILED` | None automatic | `error_msg` set, video reprocessed after fix |
+| L5 | Plan duration out of tolerance after 2-3 LLM correction attempts | No | Falls back to programmatic trim (drop lowest-relevance clips) | None — deterministic fallback always succeeds |
+| L5 | Referenced `scene_id`/timestamp invalid | Yes — plan rejected | None automatic | User/L5 caller must re-request plan |
+| L6 | Neo4j projection write fails | No — non-fatal | None automatic | Logged; Postgres remains source of truth; retry/backfill is v-next. (Pinecone row superseded — B7 dropped Pinecone entirely, projection is Neo4j-only now.) |
+| L6 | `AUDIO_DUCK_REQUEST` op with no secondary audio asset | No — documented no-op | N/A | Surfaced as a note in `run_level6`'s result, not silent |
+
+---
+
+## PIPELINE ADDENDUM 2 — QA Agent + Correction Feedback Loop + Client Style Profiles
+
+### STATUS: IMPLEMENTED — not yet run end-to-end (same caveat as every other
+level in this doc: code is complete, `py_compile`-clean, 175/175 pytest
+passing, migrations 001-016 sequential with no gaps — but no real video has
+exercised the QA Agent, correction feedback loop, or style-profile priors
+yet, because no real video has exercised L1-L6 itself yet). User overrode
+the original gating recommendation ("build after first real client video")
+and asked for all three built now — done. The original rationale below is
+preserved for why the gate existed, not as a currently-blocking status.
+
+### Why gated, and why the feedback loop is the exception
+
+L1-L6 plus Addendum 1 are fully coded but per their own STATUS lines have
+never run end-to-end on a real paying job. Adding more agents before that
+happens repeats the same failure mode already flagged in this doc's own
+design discipline: sophistication added without a feedback signal from
+reality to say whether it's the *right* sophistication. Concretely — a QA
+agent's checks and thresholds (what counts as "black frame," what loudness
+range is acceptable, what "drifted caption" means in practice) are informed
+by what actually breaks on a real render, which doesn't exist yet. Building
+it now means guessing thresholds twice: once now, once for real after the
+first client video exposes what actually goes wrong.
+
+The feedback loop doesn't have this problem — `scene_overrides` and
+`storyline_overrides` already exist (Addendum 1, L4), so wiring a write path
+into them costs nothing to have ready, and every real correction from here
+forward becomes data instead of being lost. This is also the actual moat:
+a system that improves from usage (corrections → future fine-tuning/few-shot)
+beats a system that only gets more features.
+
+**No new numbered level for any of these three.** QA sits at the tail of
+L6 (same "specialized action agent" tier as Color/Caption/Compositing).
+The feedback loop is a write path into L4/L5's existing override machinery,
+not a stage with its own input/output contract. Style profiles are a table
+L5/L6 read as a soft prior, same shape as reading `persons`/`scenes` — not
+a processing stage at all.
+
+### 1. QA / Validation Agent — IMPLEMENTED
+
+`pipeline/level6/qa_agent.py` + `prompts/qa_review.py` + migration
+`015_qa_reports.sql`. Wired as the final step of `run_level6`, after render
++ all other L6 agents. Deterministic checks (blackdetect/silencedetect via
+FFmpeg, loudness re-measured against the actual delivered render via
+`audio_sync.py`'s own filter-builder, caption drift vs L3's
+`dialogue_subtitle`, color clipping via `color_grading_runner.py`'s existing
+clamp bounds — all reused, nothing re-invented) plus one Groq intent-match
+pass. Surfaces `qa_status`/`qa_report_id` in `run_level6`'s result without
+raising or blocking (rule 24 — reports, never edits). Spec below is the
+as-built design.
+
+**Level: L6, tail** — runs after Editing Director's render, before delivery.
+Split same as every other L6 agent: deterministic checks first (cheap, no
+LLM), one narrow LLM pass only for what a formula can't catch.
+
+**Deterministic checks (no LLM, run first, always):**
+- Black-frame detection — FFmpeg `blackdetect` filter over the rendered output
+- Silence/audio drop-out detection — FFmpeg `silencedetect`
+- Loudness range check — reuse `audio_sync.py`'s existing `loudnorm`
+  measure-pass output (already computed for normalization, don't recompute)
+- Caption/transcript drift check — compare each `TEXT_OVERLAY_REQUEST`'s
+  rendered caption text against its source `dialogue_subtitle` (already
+  grounded in real transcript per L6 rules) — pure string diff, not LLM
+- Color clipping check — reuse `color_grades`/`sequence_color_adjustments`
+  data already computed, flag if the applied FFmpeg `eq`/`colorbalance`
+  params would clip (out-of-range values), don't re-analyze pixels
+
+**LLM pass (Groq `qwen/qwen3.6-27b`, one call per delivered plan, text-only —
+no vision call, since sampled-frame visual review isn't worth a second model
+tier for v1):** compare the `edit_plan.user_prompt` (stated intent) against
+the assembled `storylines`/`scenes` text actually selected, flag if the
+delivered cut's content doesn't match what was asked for (e.g. user asked
+for "Person X's commentary only," QA checks `cut_list_items` participants
+against that). Closed-set discipline same as every other L6 agent — reports
+a pass/fail + reasoning, never edits the plan itself (rule 18: L6 doesn't
+re-interpret intent, it flags for a human).
+
+New table:
+```sql
+CREATE TABLE qa_reports (
+  id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  edit_plan_id   UUID REFERENCES edit_plans(id),
+  video_id       UUID REFERENCES videos(id),
+  status         TEXT NOT NULL CHECK (status IN ('pass', 'warn', 'fail')),
+  deterministic_checks JSONB NOT NULL,   -- {black_frames: [...], silences: [...], loudness_range, caption_drift: [...], clipping: [...]}
+  llm_review     TEXT,
+  llm_status     TEXT CHECK (llm_status IN ('pass', 'warn', 'fail', NULL)),
+  created_at     TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+`processing_jobs`-style gate: a `fail` status blocks delivery (surfaced to
+whatever delivers the video to the client, human-in-the-loop review), a
+`warn` delivers with a flagged note, `pass` delivers clean. Never silently
+auto-fix — QA reports, it doesn't edit (same one-way-boundary discipline as
+L5→L6 generally).
+
+File: `pipeline/level6/qa_agent.py`, prompt: `prompts/qa_review.py`.
+
+### 2. Correction Feedback Loop — BUILD NOW
+
+**What exists already (Addendum 1, L4):** `scene_overrides` and
+`storyline_overrides` tables let a human-caught correction patch a `final`
+storyline/scene without burning a full L4 re-run. What's missing: nothing
+currently *writes* to them from a real correction event, and nothing logs
+the correction anywhere durable for future fine-tuning — a fix today is a
+one-off patch, not data.
+
+**New table — the actual corrections dataset:**
+```sql
+CREATE TABLE correction_events (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  video_id           UUID REFERENCES videos(id),
+  level              SMALLINT NOT NULL,        -- which level's output was corrected (2, 4, 5, 6)
+  entity_type        TEXT NOT NULL,            -- speaker_turn | canonical_relation | scene | storyline | edit_plan | qa_report
+  entity_id          UUID NOT NULL,
+  field              TEXT NOT NULL,
+  original_value     JSONB NOT NULL,
+  corrected_value    JSONB NOT NULL,
+  correction_source  TEXT NOT NULL,            -- client | internal_editor | qa_agent_flag
+  reason             TEXT,
+  created_at         TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Write path, additive to code that already exists:**
+- `scene_overrides`/`storyline_overrides` inserts (Addendum 1, already
+  planned but never wired to a real trigger) now always also insert a
+  matching `correction_events` row — one function,
+  `pipeline/feedback/correction_logger.py::log_correction()`, called from
+  both override-insert sites so there's exactly one place this can drift.
+- `edit_plan_revisions` (L5, already exists — "diffs, not regenerates," rule
+  21) gets the same treatment: every revision insert also logs a
+  `correction_events` row with `level=5`, `entity_type='edit_plan'`,
+  `original_value`/`corrected_value` derived from the diff.
+- L4 speaker-turn / relation corrections (if a human overrides an
+  `llm_tiebreak` or `canonical_relation` after the fact) — same pattern,
+  needs a small new admin write path since none exists yet for L4 outputs
+  specifically (L4 currently has no post-hoc human-correction entry point
+  at all — this is a real gap this item fixes, not just instrumentation).
+
+**Why this is the moat, concretely:** `correction_events` rows are the
+first-class dataset for (a) few-shot examples injected into L4/L5 prompts
+for repeat clients — "here's how this client's speaker attributions usually
+get corrected," (b) eventual fine-tuning data once volume justifies it, (c)
+the QA Agent's own threshold tuning once it exists (real corrections tell
+you what the deterministic checks should actually flag). None of this
+requires L1-L6 architecture changes — it's a table and one logging function.
+
+File: `pipeline/feedback/correction_logger.py`, `pipeline/feedback/__init__.py`.
+Migration: `014_correction_feedback.sql` (adds `correction_events`, and the
+missing L4 human-correction write path table if needed — TBD at
+implementation time whether L4 corrections reuse `scene_overrides`/
+`storyline_overrides` field-level shape or need their own `speaker_turn_
+overrides`/`relation_overrides` tables; decide when actually wiring the L4
+entry point, not speculatively now).
+
+### 3. Client Style Profiles — IMPLEMENTED
+
+`videos.client_id` (nullable) + `client_style_profiles` table, migration
+`016_client_style_profiles.sql`. Read as a soft prior by L5 Pass B
+(`pipeline/level5/planner_runner.py`, `pacing_preference` →
+`client_style_pacing_preference` in `prompts/l5_sequencing.py`, explicitly
+subordinate to the user's per-edit `pacing_preference` and to
+`causal_link_to_next` on conflict) and L6's Color Grading Agent
+(`brand_colors` → `target_brand_bias`) + Caption/Text Overlay Agent
+(`caption_style` → `client_style_prior`, never touches caption `text`
+itself). No `client_id`, or a `client_id` with no profile row, produces
+byte-identical prompt payloads to pre-Addendum-2 behavior — verified by
+construction, every lookup gates on truthiness before injecting anything.
+Spec below is the as-built design.
+
+**New table:**
+```sql
+CREATE TABLE client_style_profiles (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  client_id          TEXT NOT NULL,             -- external client identifier, not a users table FK (no user system speced yet)
+  caption_style      JSONB DEFAULT '{}',        -- font, size, position, karaoke vs static preference
+  pacing_preference  TEXT,                       -- fast | moderate | slow, informs L5 Pass B cut density
+  brand_colors       JSONB DEFAULT '{}',         -- target color-grade bias, informs L6 Color Grading Agent
+  default_platform   TEXT,                       -- reel | full_cut | youtube | ...
+  notes              TEXT,
+  created_at         TIMESTAMPTZ DEFAULT NOW(),
+  updated_at         TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Read contract, additive not required:** L5 Pass B (sequencing/pacing) and
+L6's Color Grading Agent + Caption/Text Overlay Agent read
+`client_style_profiles` for the video's `client_id` **if a row exists** —
+soft prior injected into the existing prompts (e.g. Color Grading Agent's
+sequence-delta prompt gets a "target brand bias" field alongside neighbor
+deltas), never a hard override of scene-grounded reasoning. No row = current
+behavior unchanged, exactly as today. This is why it's safe to defer: it's
+additive to already-working prompts, not a prerequisite for them.
+
+Where `client_id` comes from is intentionally left open — no client/user
+system exists in the current schema (`videos` has no `client_id` column
+yet). Adding one is part of this item's implementation, not decided now.
+
+### Engineering rules extending the list (24-26)
+
+24. **QA Agent reports, never edits** — a `fail`/`warn` status blocks or
+    flags delivery for human review; it never mutates `edit_plans`,
+    `cut_list_items`, or triggers an automatic re-render. Same one-way
+    boundary as every other cross-level read contract in this doc.
+25. **Every override write is also a correction_events write** — no code
+    path inserts into `scene_overrides`/`storyline_overrides`/
+    `edit_plan_revisions` without also logging to `correction_events` via
+    `log_correction()`. One function, not duplicated logic per call site,
+    so the corrections dataset can't silently drift out of sync with the
+    override tables it's supposed to mirror.
+26. **Style profiles are a prior, never a constraint** — `client_style_
+    profiles` rows inform prompt context; they must never hard-block a
+    scene-grounded decision (e.g. a pacing preference doesn't force a cut
+    that violates `causal_link_to_next`). If a future version needs hard
+    constraints, that's a new field with its own validation path, not an
+    overload of this table's soft-prior semantics.
+
+---
+
+## PIPELINE ADDENDUM 3 — L7 Evaluation, L8 Human Feedback, L9 Reward/Punishment
+
+### STATUS: SPEC'D, AWAITING USER REVIEW — DO NOT IMPLEMENT WITHOUT SIGN-OFF
+
+Same convention as the original plan at the top of this doc: written before code, reviewed before build. This addendum exists because a real audit (agent-run, against live code and the live Postgres DB, not doc claims) scored the pipeline's evaluation/guardrail coverage **4.3/10** — see "Audit findings" below. L7-L9 are the direct, gap-driven response, not speculative feature-building. Every item below traces to a specific numbered gap the audit found.
+
+### Audit findings (2026-07-31, against live code + live DB — 12 videos processed at the time)
+
+| # | Area | Score | Real finding |
+|---|---|---:|---|
+| 1 | Schema/structural validation | 8/10 | Real pydantic gates + closed-set enums exist. But 6/176 `tests/integration` schema-drift tests **currently fail** against live code — contradicts this doc's own earlier "175/175 passing" claim (Addendum 2 STATUS line), which was accurate when written and has since drifted. |
+| 2 | Completeness gates | 7/10 | `finalize_level4` genuinely checks speaker-turn terminality / scene coverage / non-null synopsis before flipping `storylines.status`→`final`. Real, not docstring-only. But live `processing_jobs` has **zero rows at level 4/5/6** — the gate has never fired via the real orchestrator, only via direct function calls in dev/debug sessions. |
+| 3 | Confidence-based escalation | 7/10 | Real, wired, bounded (`grounding_runner.py`). Never exercised to completion on a real orchestrated run. |
+| 4 | Deterministic quality checks | 7/10 | Real, reused (blackdetect/silencedetect/loudness/caption-drift/color-clip in `qa_agent.py`). One real `qa_reports` row exists in the live DB (`status='warn'`). |
+| 5 | LLM-as-judge checks | 4/10 | Code exists (Groq intent-match pass in `qa_agent.py`) but the one real row in the DB has `llm_status=NULL` — didn't actually run to completion on the only real execution so far (missing `GROQ_API_KEY` in that run's environment). Narrow scope (intent-match only) even when it does run. |
+| 6 | Offline/golden-set testing | 1/10 | `tests/fixtures/README.md` states plainly: no video assets are committed. Zero golden cases exist. |
+| 7 | Human-in-the-loop feedback capture | 3/10 | `correction_events` + `correction_logger.py` real and wired for **L5 only**. `log_scene_correction`/`log_storyline_correction` (L4) have **zero callers anywhere in the codebase** — dead code, no entry point exists to actually log an L4 correction. Live table: 0 rows. |
+| 8 | Regression/drift tracking | 5/10 | `pipeline_alerts` real and written to (7 live rows, `l4_canonical_relation_other_rate` breaching its 0.05 threshold at 0.17-0.30 on every real run). Nothing reads or surfaces these — write-only log. |
+| 9 | Cost/latency observability | 2/10 | Only `logger.info(...)` of token counts — no durable table. `processing_jobs.meta` was speced (B2) to carry `{tokens, cost_usd}` and never implemented. |
+| 10 | End-to-end/integration testing | 2/10 | "Integration" tests are schema-drift/pydantic unit tests, not full-pipeline runs. Nothing asserts on output *quality* — only "didn't throw." |
+
+**Weighted overall: 4.3/10** (completeness gates, LLM-judge, human-feedback loop, and offline-testing weighted higher — these are the ones that catch *substantive* quality regressions, not just structural bugs).
+
+### Design principle for L7-L9
+
+Same discipline as every other level in this doc: **deterministic where possible, LLM only for the specific judgment call that can't be reduced to a formula** (rule 20, applied one level up). L7 mostly extends things that already exist and work (`qa_agent.py`'s deterministic checks, `pipeline_alerts`) rather than inventing new machinery. L8 is schema + one missing entry point, not a new agent. L9 is explicitly bounded — a reward/punishment *signal* and its two concrete consumers (few-shot injection, ontology-versioning triggers), **not** an RL training loop or a fine-tuned reward model. This pipeline doesn't have the data volume for that yet (same "don't build for the level you don't have" call already made for Motion Graphics, cross-video identity, and the Style Learning System's embedding phase).
+
+---
+
+### LEVEL 7 — EVALUATION
+
+Closes gaps #1, #3, #4, #6, #8, #9, #10.
+
+**7a. Golden-set bootstrap (closes gap #6).** `tests/fixtures/` gets its first real case: the video/edit-plan pair already produced and manually verified in this session — `video_id=97199656-d176-46aa-88b4-026670be4576`, `edit_plan_id=b276be9d-c803-4cba-b86e-e3da624c479f`, rendered output confirmed structurally valid (full-file ffmpeg decode scan, zero errors) and matching the plan's requested clip order. Snapshot: the `storylines`/`scenes` rows (JSON dump, same shape as the L4 export already produced this session), the `edit_plans.operations` array, and the rendered output's `ffprobe` metadata (duration/codec/resolution) as the expected-output baseline. `tests/integration/test_e2e_golden.py` asserts a rerun of L4→L5→L6 against this video reproduces output within tolerance (scene count ±2, achieved duration ±5%, no `qa_status='fail'`) — not byte-identical (LLM non-determinism is expected and already documented extensively in this doc), but structurally equivalent. This is the FIRST end-to-end quality test this pipeline will have (closes gap #10 partially — see 7d for the rest).
+
+**7b. Rubric scoring — extend `qa_agent.py`, don't replace it (closes gap #1, partially #5).** The existing Groq intent-match pass becomes one dimension of a multi-dimension rubric, not the whole check:
+
+```
+SYSTEM PROMPT — QA Agent: Rubric Review (extends existing intent-match prompt)
+────────────────────────────────────────────────────────────────────────────
+Score this delivered edit against FOUR dimensions, 0-10 each, grounded ONLY
+in the storylines/scenes/edit_plan data already provided (same closed-set
+discipline as every other agent in this pipeline — never invent a judgment
+about footage you weren't shown):
+
+  intent_match      — does the assembled content match user_prompt
+                       (existing check, unchanged)
+  narrative_coherence — do the selected scenes in this order tell a
+                       coherent story per their causal_link_to_next chains
+  pacing_consistency  — do cut durations follow a defensible rhythm, or
+                       does the sequence feel arbitrary (grounded in
+                       sequence_color_adjustments/cut_list_items durations
+                       already computed, not re-analyzing pixels)
+  technical_cleanliness — cross-check against the deterministic checks
+                       already run (blackdetect/silencedetect/caption-drift/
+                       clipping) — does the LLM's read agree with what the
+                       formulas already found, flag if not (a real
+                       disagreement here is itself a signal worth logging)
+
+Return one score + one-sentence rationale per dimension via the
+score_edit_rubric tool call. Never invent a score dimension not listed.
+```
+
+New table `evaluation_scores` (one row per `qa_reports` row, 1:1 extension):
+
+```sql
+CREATE TABLE evaluation_scores (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  qa_report_id          UUID REFERENCES qa_reports(id) ON DELETE CASCADE,
+  edit_plan_id          UUID REFERENCES edit_plans(id),
+  intent_match          FLOAT,
+  narrative_coherence   FLOAT,
+  pacing_consistency    FLOAT,
+  technical_cleanliness FLOAT,
+  rationale             JSONB NOT NULL DEFAULT '{}',  -- {dimension: sentence}
+  created_at            TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+Written by `qa_agent.py` right after the existing intent-match call — same non-fatal discipline as the rest of L6 (a failed rubric call leaves `evaluation_scores` absent, doesn't block delivery — `qa_status` is still gated by the deterministic checks + existing intent-match pass, rubric scores are additive signal for L9, not a new blocking gate; rule 24 still applies, unchanged).
+
+**7c. Durable cost/latency tracking (closes gap #9).** New table, not a `processing_jobs.meta` JSONB blob (queryable columns > buried JSON for something this doc already wants to alert on):
+
+```sql
+CREATE TABLE llm_call_log (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  video_id         UUID REFERENCES videos(id),
+  level            SMALLINT NOT NULL,           -- 4, 5, or 6
+  stage            TEXT NOT NULL,                -- e.g. 'grounding_speaker', 'story_architect', 'l5_selection'
+  model            TEXT NOT NULL,
+  prompt_tokens    INT,
+  completion_tokens INT,
+  cost_usd         FLOAT,                        -- computed from OpenRouter's per-model pricing, best-effort
+  latency_ms       INT,
+  created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX ON llm_call_log(video_id, level);
+```
+
+One `log_llm_call()` helper in `shared/llm_client.py`, called from every `_call_tool`/`_call_groq_tool` site right after each `chat.completions.create` response (the `usage` object is already being read for the existing `logger.info` calls — this just also persists it). Non-fatal: a failed insert logs and continues, never blocks the actual LLM-consuming call.
+
+**7d. `pipeline_alerts` gets a consumer (closes gap #8).** Extend the dashboard's existing L4 Reasoning tab (built earlier this session) with an "Alerts" panel — a simple table of `pipeline_alerts` rows for the selected video, red-highlighted if `value > threshold`. This alone closes the "write-only log" problem — no new alerting infra needed, the data already exists, it just needs a screen. (A push-notification/Slack-webhook consumer is a reasonable v-next, not required for this addendum.)
+
+---
+
+### LEVEL 8 — HUMAN FEEDBACK
+
+Closes gap #7 fully, and is the direct answer to "negative prompt / negative feedback."
+
+**8a. Fix the dead L4 correction entry point.** `log_scene_correction`/`log_storyline_correction` exist in `pipeline/feedback/correction_logger.py` but have zero callers. Add the missing call sites: a small CLI script `scripts/log_l4_correction.py` (same shape as `scripts/run_l5.py`/`run_l6.py` — this pipeline already has no admin UI, CLI is the established pattern) that takes `--video-id --entity-type (scene|storyline) --entity-id --field --corrected-value --reason` and calls the existing (already-correct, just never-invoked) logger function. This is the smallest possible fix for the biggest single gap the audit found — no new logic, just a way to actually call code that already works.
+
+**8b. `human_feedback` — holistic/qualitative feedback, distinct from `correction_events`.** `correction_events` is field-level: "this exact value was X, should be Y." That can't express "this cut felt jarring" or "I love how this scene flows" — there's no specific field to diff. This is the actual gap behind "negative prompt / negative feedback":
+
+```sql
+CREATE TABLE human_feedback (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  video_id      UUID REFERENCES videos(id),
+  edit_plan_id  UUID REFERENCES edit_plans(id),      -- nullable — feedback can be on the video generally
+  scene_id      UUID REFERENCES scenes(id),           -- nullable — feedback can be scene-scoped or general
+  sentiment     TEXT NOT NULL CHECK (sentiment IN ('positive', 'negative', 'neutral')),
+  category      TEXT NOT NULL CHECK (category IN
+                  ('pacing', 'color', 'caption', 'speaker_attribution',
+                   'narrative', 'music_audio', 'b_roll', 'other')),
+  free_text     TEXT NOT NULL,
+  rating         SMALLINT CHECK (rating BETWEEN 1 AND 5),  -- optional, nullable
+  source        TEXT NOT NULL DEFAULT 'client',       -- client | internal_editor
+  created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX ON human_feedback(video_id);
+CREATE INDEX ON human_feedback(edit_plan_id);
+```
+
+Same CLI-first pattern as 8a: `scripts/log_human_feedback.py --video-id --sentiment --category --text [--edit-plan-id] [--scene-id] [--rating]`. A dashboard form is a reasonable v-next (the dashboard already reads this DB — adding a write form is additive, not required for this addendum to be useful).
+
+**8c. Negative feedback is not just "delete/ignore" — it's a first-class signal for L9.** This is the point of splitting `human_feedback` from `correction_events`: a correction says "fix this specific thing," negative feedback says "this pattern is wrong even though I can't point at one field" — e.g. "the pacing always feels too slow for this client's reels." L9 reads `human_feedback.sentiment='negative'` rows aggregated by `category` as its punishment signal (see below) — this is the entire reason category is a closed enum here, not free text: it needs to be aggregatable.
+
+---
+
+### LEVEL 9 — REWARD & PUNISHMENT
+
+Explicitly bounded scope — a signal + two consumers, not a training system.
+
+**9a. `reward_signals` — the aggregation layer.** Not raw storage (that's `evaluation_scores` + `human_feedback`, already real tables) — this is a computed rollup, recomputed periodically (a script, not a live trigger — `scripts/compute_reward_signals.py`, safe to rerun, UPSERT on `(scope_type, scope_key)`):
+
+```sql
+CREATE TABLE reward_signals (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  scope_type    TEXT NOT NULL,      -- 'canonical_relation' | 'pacing_style' | 'color_style' | 'client'
+  scope_key     TEXT NOT NULL,      -- e.g. the relation name, or a client_id
+  reward_score  FLOAT NOT NULL,     -- rolling average of evaluation_scores dims + human_feedback sentiment, -1..1
+  sample_count  INT NOT NULL,
+  updated_at    TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (scope_type, scope_key)
+);
+```
+
+`reward_score` formula (deterministic, no LLM — same "deterministic where possible" discipline): normalize `evaluation_scores` dimensions to -1..1, map `human_feedback.sentiment` to {positive: +1, neutral: 0, negative: -1} weighted by `rating` when present, average per `scope_key` with a minimum `sample_count` floor (don't trust an average of 1-2 samples — same confidence-weighted-shrinkage principle already used for the Style Learning System discussion). This directly extends that earlier design conversation — `reward_signals` scoped by `client` is the numeric backbone the Style Learning System's "creator profile" would eventually read from.
+
+**9b. Reward → few-shot injection (the "moat" mechanism Addendum 2 proposed but never built).** When `L4_STORY_ARCHITECT_MODEL`/`L5_SEQUENCING_MODEL` calls run for a video with a known `client_id`, look up `reward_signals WHERE scope_type='client' AND scope_key=client_id AND sample_count >= 5` — if present, inject the top-N highest-`reward_score` past `scenes.summary`/`storylines.beats` for that client as few-shot examples in the prompt (bounded, same batch-cap discipline as rule 23 — cap at 3-5 examples, not an unbounded dump). Soft prior only (rule 26 still applies) — never overrides grounded data, only nudges style/phrasing toward what's historically scored well for that client.
+
+**9c. Punishment → ontology/prompt versioning trigger (extends the existing OTHER-bucket mechanism, doesn't invent a new one).** `reward_signals WHERE scope_type='canonical_relation' AND reward_score < -0.3 AND sample_count >= 10` is a new alert condition feeding the SAME `pipeline_alerts` table + review workflow already speced for the OTHER-bucket rate (CLAUDE.md's existing "signal to review and version the ontology" language) — a canonical relation that's technically well-classified (not `OTHER`) but consistently scores badly in human feedback is just as real a signal for ontology review as the OTHER-bucket rate is. Same human-review-then-version response, not automated remapping — rule 12 (closed-set outputs only, human decides new categories) still applies.
+
+**9d. Explicitly out of scope for this addendum** (v-next, same discipline as Motion Graphics/cross-video identity/style embeddings): fine-tuning any model, automated prompt rewriting, RL training loops, automated threshold adjustment without human review. `reward_signals` is a **reporting and retrieval** table, not a control system that changes pipeline behavior without a human in the loop reading `pipeline_alerts` first.
+
+---
+
+### New tables summary (migration `017_l7_l8_l9_evaluation.sql`)
+
+`evaluation_scores`, `llm_call_log`, `human_feedback`, `reward_signals` — all additive per the existing migration policy (B5 — never a destructive change to existing tables). No existing table's schema changes in this addendum.
+
+### Engineering rules extending the list (27-30)
+
+27. **L7's rubric scoring is additive to `qa_status`, never a new blocking gate on its own** — `evaluation_scores` informs L9, it does not change whether `qa_agent.py` marks a delivery `pass`/`warn`/`fail`. That gate stays owned by the deterministic checks + existing intent-match pass (rule 24 unchanged).
+28. **`human_feedback.category` is a closed enum, not free text** — same closed-set discipline as everything else in this pipeline (rule 12's principle applied to a new area); `reward_signals` aggregation requires it to be a stable, small set of keys, not an open-ended string that can't be rolled up.
+29. **`reward_signals` never mutates pipeline behavior directly** — it's read by prompt-construction code (9b) and alert logic (9c), both human-reviewed downstream steps, same one-way-boundary discipline as every cross-level read contract in this doc (L5 reads L4's `final` output only, L6 reads L5's plan only, etc. — L9's signal is consumed the same way, never a live feedback loop that changes behavior without a human step in between).
+30. **Every new table in this addendum must have a real caller before STATUS moves past "implemented"** — the audit's single biggest finding was code that exists but is never invoked (`log_scene_correction`, the rubric-adjacent `llm_status=NULL` row). Any implementation PR for L7-L9 must include the call site, not just the table/function, and must be verified against a real run (same standard this session's live L4/L5/L6 bug fixes were held to) before claiming done.
+
+---
+
+## PIPELINE ADDENDUM 4 — Editor Style Profile Learning (extends Addendum 2, item 3)
+
+### STATUS: SPEC'D — building now, see IMPLEMENTATION STATUS SNAPSHOT at top of doc for live progress
+
+**Not a new numbered level.** This closes a gap this doc already identified twice: Addendum 2 item 3 ("Client Style Profiles") built `client_style_profiles` as a soft-prior consumption point, but every field on it was always meant to be *hand-set* — "learned from exemplar videos" was explicitly deferred. This addendum is that deferred piece, and it plugs into levels that already exist rather than adding one:
+
+```
+INGEST  (L1+L2, unchanged)  →  EXTRACT (new, deterministic)  →  STORE (client_style_profiles, already exists)  →  CONSUME (L5 Pass B + L6 Color Grading, already reading it)  →  IMPROVE (L9 9b/9c, already built, just unwired)
+```
+
+### Why this was cheap to spec: almost everything already exists
+
+| Piece needed | Status before this addendum |
+|---|---|
+| Shot-boundary detection | Already real — ASHFS, L1 |
+| Per-shot 45-param color analysis | Already real — `color_grades` table, L2 |
+| Word-level transcript timing | Already real — `transcript_segments`, L1 |
+| `videos.client_id` column | Already exists (migration 016), nullable, just never populated on any real video |
+| `client_style_profiles` table + upsert function | Already exists (migration 016) — `upsert_client_style_profile`, `ON CONFLICT (client_id) DO UPDATE` |
+| L5 Pass B reading `client_style_pacing_preference` as soft prior | Already wired (Addendum 2) |
+| L6 Color Grading reading `brand_colors` as soft prior | Already wired (Addendum 2) |
+| L9 9b: reward-scored few-shot injection per `client_id` | Already built this session — was reported "not live-reachable, no video has client_id set" |
+| L9 9c: per-client reward tracking | Already built |
+
+**The only genuinely new code**: a deterministic metric-extraction script, and wiring `client_id` onto real video rows. Everything downstream already consumes the shape this produces.
+
+### Phase 0 — Ingest (reuse L1+L2, no new code)
+
+Editor supplies 3-5 of their own already-edited/finished videos. Each runs through **L1 (ASHFS + Whisper) + L2 (color grading; face/diarization optional, not needed for style analysis)** — the same Modal functions already processing the other 12 real videos in this DB. No L3-L6 needed — we are analyzing *existing* style, not generating a new edit for these.
+
+### Phase 1 — Deterministic metric extraction (`scripts/build_editor_profile.py`, new)
+
+Pure functions, **no LLM call** — same "deterministic where possible" discipline as `usability_score` (L4), cut-snapping (L6), and every other formula-not-model decision in this pipeline:
+
+- **Pacing**: avg shot length, median shot length, shot-length variance, and the full cut-duration *sequence* (not just a mean — a "tight-tight-tight-hold" rhythm signature is lost if you only keep the average), computed from `shots`.
+- **Color**: mean + variance per `color_grades` parameter across all shots in all 3-5 videos — the 45 parameters already exist per shot, this is pure aggregation, no new analysis.
+- **Audio**: loudness target + dynamic range via an `ffmpeg loudnorm` measure-only pass — reuses the same measurement `pipeline/level6/audio_sync.py::compute_loudnorm_filter` already does, just run in measure mode against the finished video instead of a rendered output.
+- **Caption style: explicitly NOT extracted.** This pipeline transcribes *spoken* audio; it has no OCR step for on-screen burned-in text, so caption density/style cannot be inferred from a finished video today. If caption style matters, it has to be a manual field on `client_style_profiles.caption_style` (already a JSONB column, already accepts hand-entered data) — stated here so nobody later assumes this addendum silently covers it.
+
+Output: one aggregated row upserted into `client_style_profiles` via the already-existing `upsert_client_style_profile`. New helper `set_video_client_id(pool, video_id, client_id)` (queries.py, appended, not modifying `upsert_video`) tags each of the 3-5 source videos with the given `client_id` so future reward-signal aggregation (Phase 3) has something to scope by.
+
+### Phase 2 — Confidence, not false authority
+
+3-5 videos is a thin sample — already flagged in this session's earlier Style Learning System discussion. No new mechanism needed: `client_style_profiles` fields are already read as a **soft prior, never a hard constraint** (rule 26, unchanged) by L5/L6. `build_editor_profile.py` records `sample_count` in `notes` (existing free-text column) so it's visible on inspection, but does not gate/withhold writing the profile — a thin-but-present prior is still better than none, per the same reasoning already used for `reward_signals`' shrinkage-not-omission design.
+
+### Phase 3 — Continuous improvement (already built — this addendum just turns it on)
+
+With `client_id` now populated on real videos: every future edit for that client produces `evaluation_scores` + optional `human_feedback`, L9's existing `compute_reward_signals.py` rolls those into `reward_signals(scope_type='client', scope_key=client_id)`, and L9 9b (already wired into `story_architect_runner.py`/`planner_runner.py`, already tested as correctly-inert on empty data) starts actually injecting top-scoring past examples once `sample_count` crosses its floor. Nothing new to build here — this phase is "the missing link gets connected," not new machinery.
+
+### New code, precisely (no new table, no new migration)
+
+- `scripts/build_editor_profile.py` — the extraction script (Phase 1).
+- `knowledge_base/postgres/queries.py` — append `set_video_client_id`.
+- No schema change: `videos.client_id` and `client_style_profiles` already exist from migration 016.
+
+### Where this sits, restated plainly for anyone skimming
+
+Not L10. It is: **new data flowing into L1/L2's existing output tables → a new deterministic extraction step reading those tables → the existing Addendum 2 storage table → the existing L5/L6 soft-prior consumption → the existing L9 reward loop.** The diagram immediately below shows exactly where.
+
+---
+
+## END-TO-END ARCHITECTURE — WHAT'S DOING WHAT (2026-07-31)
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  SOURCE VIDEO (R2 URL or local path)                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ L1 — STRUCTURE (parallel)                          MODELS: none (local, deterministic) │
+│   ASHFS: shot detect → DINOv2 → keyframes    →  shots, keyframes, chunks              │
+│   Whisper large-v3 (local faster-whisper)    →  transcript_segments                   │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ L2 — PER-SHOT SIGNAL (3-way parallel)              MODELS: local only                  │
+│   Face: ArcFace+HSEmotion+ByteTrack (ONNX)   →  persons, face_appearances             │
+│   Color: 45-param OpenCV/CuPy analysis       →  color_grades                          │
+│   Diarization: pyannote-3.1 (gated HF model) →  speaker_turns                         │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+        │
+        ├──────────────────────────────────────────────┐
+        ▼                                                │  (Addendum 4, editor's OWN
+┌──────────────────────────────────────────────────┐     │   finished videos only —
+│ L3 — VISION UNDERSTANDING                         │     │   does NOT continue past L2)
+│   Qwen/Qwen3-VL-8B-Instruct (self-hosted vLLM,    │     ▼
+│   Modal L40S/A100)                          →  frame_analyses, kg_nodes, kg_edges     ┌───────────────────────┐
+└──────────────────────────────────────────────────┘     │ ADDENDUM 4 — deterministic  │
+        │                                                 │ metric extraction (no LLM) │
+        ▼                                                 │ pacing/color/audio stats   │
+┌──────────────────────────────────────────────────┐      │  → client_style_profiles   │
+│ L4 — REASONING                MODEL: deepseek/deepseek-v3.2 (OpenRouter)              │
+│   Grounding Agent  (reasoning=False, closed-set)  →  speaker_turns resolved,          │
+│                                                       kg_edges.canonical_relation      │
+│   Story Architect  (reasoning=True, synthesis)    →  scenes, storylines(final)        │
+└──────────────────────────────────────────────────┘      └────────────┬──────────────┘
+        │                                                               │ soft prior
+        ▼                                                               │ (rule 26)
+┌──────────────────────────────────────────────────┐                    │
+│ L5 — PLANNING                                                          │
+│   Pass A Selection: qwen/qwen3-30b-a3b-instruct-2507 (OpenRouter)      │
+│   Pass B Sequencing: qwen/qwen3-235b-a22b-2507 (OpenRouter) ◄──────────┤ client_style_pacing_preference
+│                                                    →  edit_plans, cut_list_items       │  + client_style_examples (L9 9b)
+└──────────────────────────────────────────────────┘                    │
+        │                                                                │
+        ▼                                                                │
+┌──────────────────────────────────────────────────┐                    │
+│ L6 — ACTION AGENTS (parallel) + RENDER                                 │
+│   Editing Director: deterministic (cut snap, per-clip extract+concat) │
+│   Color Grading: qwen/qwen3-30b-a3b-instruct-2507  ◄────────────────────┤ brand_colors soft prior
+│   Caption/Text Overlay: qwen/qwen3-30b-a3b-instruct-2507               │
+│   Compositing (A3/A5): qwen/qwen3-30b-a3b-instruct-2507                │
+│   Audio Sync: deterministic DSP                                        │
+│   QA Agent: deterministic checks + qwen/qwen3-235b-a22b-2507 (intent)  │
+│                                                    →  out.mp4, qa_reports              │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│ L7 — EVALUATION                    MODEL: qwen/qwen3-235b-a22b-2507 (OpenRouter,       │
+│   Rubric scoring (4-dim, extends QA Agent)         same call as QA intent-match)       │
+│   Cost/latency log (deterministic)                                                     │
+│                                                    →  evaluation_scores, llm_call_log  │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│ L8 — HUMAN FEEDBACK                MODEL: none (CLI + tables)                          │
+│   log_l4_correction.py / log_human_feedback.py    →  correction_events,               │
+│                                                       human_feedback                   │
+└──────────────────────────────────────────────────┘
+        │
+        ▼
+┌──────────────────────────────────────────────────┐
+│ L9 — REWARD & PUNISHMENT           MODEL: none (deterministic aggregation)             │
+│   compute_reward_signals.py  →  reward_signals                                        │
+│     ├─ 9b → few-shot injection back into L4 Story Architect + L5 Pass B (above)        │
+│     └─ 9c → pipeline_alerts (negative-reward relation types → human ontology review)   │
+└──────────────────────────────────────────────────┘
+
+STORES:  Postgres (Neon) — source of truth for everything above (pgvector for embeddings,
+         B7 dropped Pinecone).  Neo4j — derived graph projection, never written independently
+         (B1).  Cloudflare R2 — keyframe/video object storage.
+
+PROVIDERS:  OpenRouter — all L4-L7 LLM calls (deepseek-v3.2, qwen3-30b, qwen3-235b).
+            Groq — configured as optional fallback only, not used by default anywhere.
+            Self-hosted vLLM (Modal GPU) — L3 only, Qwen3-VL-8B.
+            Local (no API) — L1/L2 models, embeddings (BAAI/bge-large-en-v1.5, currently
+            broken in this environment — see IMPLEMENTATION STATUS SNAPSHOT), L6/L9
+            deterministic DSP/aggregation.
+```
+
+---

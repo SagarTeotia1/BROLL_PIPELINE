@@ -57,6 +57,19 @@ different points in the source footage)
   mood_target: optional string (e.g. "warmer", "cinematic", a scene's \
 emotional_arc description), or null if no explicit mood direction was \
 requested
+  target_brand_bias: OPTIONAL. Present only when this video's client has a \
+saved style profile with `brand_colors` on file (CLAUDE.md "PIPELINE \
+ADDENDUM 2" -> "3. Client Style Profiles") — null whenever no such \
+profile exists, which is the common case and must change nothing about \
+how you grade. THIS IS A SOFT PRIOR, NEVER A HARD CONSTRAINT (rule 26): \
+when a correction is ALREADY warranted by neighbor-continuity (step 2 \
+below), target_brand_bias may nudge which direction you pull within the \
+correction budget continuity already justifies — same relationship \
+mood_target already has to that budget. It never justifies a correction \
+that continuity alone would not, and it never overrides a clip's own \
+legitimate creative difference from its neighbors just to chase a brand \
+color. If target_brand_bias and mood_target disagree, treat mood_target \
+(the explicit per-job request) as the stronger signal.
 
 For EACH clip, decide param-by-param (only for params present in \
 base_parameters and at least one neighbor's base_parameters):
@@ -81,7 +94,10 @@ calls (e.g. "warmer" nudges white_balance.temperature/color_wheels toward \
 warmer within the correction budget already justified by neighbor \
 continuity) — it does not license a larger correction than continuity \
 alone would justify, and it never overrides a hard outlier correction with \
-an unrelated stylistic push.
+an unrelated stylistic push. target_brand_bias, when present, behaves the \
+same way and at the same (subordinate) priority — a soft nudge on \
+direction only, inside a budget continuity already earned, never a reason \
+to touch a clip that step 2 judged did not need correction.
   5. Emit `sequence_delta` as {param_name: delta} where delta = your \
 recommended new value MINUS base_parameters[param_name]. Omit any param you \
 decided not to touch — an omitted key means zero correction, not zero \

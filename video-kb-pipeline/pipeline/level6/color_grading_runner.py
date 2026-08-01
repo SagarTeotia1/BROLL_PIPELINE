@@ -60,11 +60,13 @@ from pydantic import ValidationError
 
 from knowledge_base.postgres.queries import (
     bulk_insert_sequence_color_adjustments,
+    get_client_style_profile,
     get_color_grades_for_video,
     get_cut_list_items_for_edit_plan,
     get_edit_plan,
     get_scenes_for_video,
     get_shots_for_video,
+    get_video,
 )
 from shared.config import settings
 from shared.types import (
@@ -163,14 +165,11 @@ def _clamp(value: float, lo: float | None, hi: float | None) -> float:
 
 
 def _get_groq_client():
-    if not settings.GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not configured — Level-6 Color Grading Agent "
-            "cannot run without it (see shared/config.py)."
-        )
-    from groq import Groq  # local import — keeps this an optional dependency
+    """Name kept for minimal diff — actually returns an OpenRouter client
+    now (see shared/llm_client.py)."""
+    from shared.llm_client import get_llm_client
 
-    return Groq(api_key=settings.GROQ_API_KEY)
+    return get_llm_client()
 
 
 async def _call_groq_tool(
@@ -180,6 +179,10 @@ async def _call_groq_tool(
     tool_schema: dict,
     payload: dict,
     max_tokens: int,
+    *,
+    pool=None,
+    video_id: str | None = None,
+    stage: str | None = None,
 ) -> dict | None:
     """Call Groq's OpenAI-compatible `chat.completions.create` with a forced
     tool call and return the tool's structured arguments as a dict, or None
@@ -188,9 +191,12 @@ async def _call_groq_tool(
     `tool_choice` forces the structured call, and
     `message.tool_calls[0].function.arguments` is a JSON STRING that must be
     `json.loads()`-ed (unlike Anthropic's pre-parsed `tool_use.input`)."""
+    import time as _time
+
     fn_name = tool_schema["function"]["name"]
     last_exc: Exception | None = None
     for attempt in range(1, _LLM_CALL_ATTEMPTS + 1):
+        _t0 = _time.monotonic()
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -202,8 +208,12 @@ async def _call_groq_tool(
                 ],
                 tools=[tool_schema],
                 tool_choice={"type": "function", "function": {"name": fn_name}},
+                # See pipeline/level4/grounding_runner.py::_call_tool for the
+                # real-video finding behind this.
+                extra_body={"provider": {"require_parameters": True}},
             )
             usage = getattr(response, "usage", None)
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
             if usage is not None:
                 logger.info(
                     "L6 color grading LLM call model=%s tool=%s prompt_tokens=%s completion_tokens=%s",
@@ -212,6 +222,18 @@ async def _call_groq_tool(
                     getattr(usage, "prompt_tokens", "?"),
                     getattr(usage, "completion_tokens", "?"),
                 )
+            # L7 7c — durable cost/latency log, non-fatal.
+            from shared.llm_client import log_llm_call as _log_llm_call
+            await _log_llm_call(
+                pool,
+                video_id=video_id,
+                level=6,
+                stage=stage or "l6_color_grading",
+                model=model,
+                prompt_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
+                completion_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
+                latency_ms=_latency_ms,
+            )
             choice = response.choices[0]
             tool_calls = getattr(choice.message, "tool_calls", None)
             if not tool_calls:
@@ -331,6 +353,16 @@ async def run_color_grading(
     no scene-mood policy decision, matching L6's "narrow and mostly
     deterministic" design principle — mood sourcing is a caller concern).
 
+    If this video's `client_id` resolves to a `client_style_profiles` row
+    with a non-empty `brand_colors` (CLAUDE.md "PIPELINE ADDENDUM 2" -> "3.
+    Client Style Profiles"), it is looked up here and passed to the LLM as
+    an OPTIONAL `target_brand_bias` field alongside the existing
+    neighbor-delta context — a SOFT PRIOR only (rule 26), never a
+    replacement for the neighbor-continuity reasoning this agent already
+    does. No client_id, or a client_id with no profile / empty
+    brand_colors, leaves `target_brand_bias` null and reproduces exactly
+    today's behavior.
+
     Returns only the adjustments this call actually decided on and wrote —
     clips that could not be resolved to a shot/color_grade, or whose batch's
     LLM call failed outright, are skipped (logged) and simply have no
@@ -350,6 +382,17 @@ async def run_color_grading(
             edit_plan_id,
         )
         return []
+
+    # CLAUDE.md "PIPELINE ADDENDUM 2" -> "3. Client Style Profiles":
+    # additive, soft-prior-only lookup. No client_id / no profile row /
+    # empty brand_colors all leave target_brand_bias as None, which
+    # reproduces exactly today's payload shape (see rule 26).
+    target_brand_bias: dict | None = None
+    video = await get_video(pool, plan.video_id)
+    if video is not None and video.client_id:
+        profile = await get_client_style_profile(pool, video.client_id)
+        if profile is not None and profile.brand_colors:
+            target_brand_bias = profile.brand_colors
 
     op_scene_by_op_id: dict[str, str | None] = {
         op.get("op_id"): op.get("scene_id") for op in plan.operations
@@ -462,10 +505,11 @@ async def run_color_grading(
 
     batches = _chunk(clip_payloads, _COLOR_BATCH_SIZE)
     for batch_idx, batch in enumerate(batches):
-        payload = {"clips": batch, "mood_target": mood_target}
+        payload = {"clips": batch, "mood_target": mood_target, "target_brand_bias": target_brand_bias}
         raw = await _call_groq_tool(
             client, settings.L6_COLOR_MODEL, L6_COLOR_GRADING_SYSTEM_PROMPT,
             COMPUTE_SEQUENCE_DELTAS_TOOL, payload, _COLOR_MAX_TOKENS,
+            pool=pool, video_id=plan.video_id, stage="l6_color_grading",
         )
         if raw is None:
             logger.error(

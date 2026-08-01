@@ -1,17 +1,24 @@
-"""Clone a video's full KB record (Postgres + Neo4j + Pinecone) under a new video_id.
+"""Clone a video's full KB record (Postgres + Neo4j) under a new video_id.
 
 Usage:
     python scripts/clone_video.py SOURCE_VIDEO_ID [--count N] [--dry-run]
 
 For each new UUID generated:
   1. Postgres — deep-copy every row FK-chained to the source video_id, with
-     fresh row ids, into the same tables under the new video_id.
+     fresh row ids, into the same tables under the new video_id. This
+     includes `searchable_facts.embedding` and `kg_nodes.embedding`
+     (`kg_nodes` already carries the "Scene" node's caption embedding — see
+     `pipeline/level3/kb_finalizer.py`) — no separate vector-store copy step
+     is needed post-B7 (Pinecone dropped, pgvector is the only vector index).
   2. Neo4j — re-derive KGNode/KGEdge objects from the freshly-cloned Postgres
      kg_nodes/kg_edges rows (ref_id already remapped) and write via the
      existing graph_writer.write_graph (same code path production uses).
-  3. Pinecone — re-upsert the cloned searchable_facts (facts namespace) and
-     copy the source video's scene vectors (scenes namespace, read directly
-     from Pinecone since there's no scenes table in Postgres).
+
+Known gap (pre-existing, unrelated to the Pinecone removal above): the
+Level-4 `scenes`/`storylines` tables are not yet part of `clone_postgres`'s
+FK-chain copy, so a clone does not carry canonical L4 scene/storyline rows
+(or their embeddings). Not introduced by this change — flagging for
+visibility, not fixing here (out of scope for B7 vendor consolidation).
 """
 from __future__ import annotations
 
@@ -28,7 +35,6 @@ import asyncpg
 
 from knowledge_base.postgres.client import get_pool, close_pool
 from knowledge_base.postgres.queries import get_kg_nodes_for_video, get_kg_edges_for_video
-from knowledge_base.pinecone_kb.client import get_index
 from knowledge_base.neo4j.graph_writer import write_graph
 from knowledge_base.neo4j.client import close_driver
 from shared.types import KGNode, KGEdge
@@ -226,7 +232,8 @@ async def clone_postgres(pool: asyncpg.Pool, source_id: str, new_id: str) -> dic
             )
             counts["frame_analyses"] = len(fa_map)
 
-            # searchable_facts — frame_id (keyframe) remapped; new pinecone_id = new fact id
+            # searchable_facts — frame_id (keyframe) remapped; new legacy_vector_id = new fact id.
+            # embedding is copied as-is — no separate vector-store re-upsert needed (B7).
             await conn.execute("CREATE TEMP TABLE map_facts (old uuid, new uuid) ON COMMIT DROP")
             rows = await conn.fetch("SELECT id FROM searchable_facts WHERE video_id = $1", uuid.UUID(source_id))
             fact_map = {r["id"]: uuid.uuid4() for r in rows}
@@ -237,7 +244,7 @@ async def clone_postgres(pool: asyncpg.Pool, source_id: str, new_id: str) -> dic
                 )
             await conn.execute(
                 """
-                INSERT INTO searchable_facts (id, video_id, frame_id, fact_text, timestamp_s, embedding, pinecone_id)
+                INSERT INTO searchable_facts (id, video_id, frame_id, fact_text, timestamp_s, embedding, legacy_vector_id)
                 SELECT mf.new, $2, mk.new, sf.fact_text, sf.timestamp_s, sf.embedding, mf.new::text
                 FROM searchable_facts sf
                 JOIN map_facts mf ON mf.old = sf.id
@@ -319,67 +326,6 @@ async def clone_neo4j(pool: asyncpg.Pool, new_id: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Pinecone clone — facts from cloned Postgres rows, scenes copied directly from Pinecone
-# ---------------------------------------------------------------------------
-
-async def clone_pinecone_facts(pool: asyncpg.Pool, new_id: str) -> int:
-    from knowledge_base.pinecone_kb.indexer import upsert_facts
-    from knowledge_base.postgres.queries import _vec_to_list
-    from shared.types import SearchableFactRecord
-
-    rows = await pool.fetch(
-        "SELECT id, video_id, frame_id, fact_text, timestamp_s, embedding, pinecone_id "
-        "FROM searchable_facts WHERE video_id = $1",
-        uuid.UUID(new_id),
-    )
-    facts = [
-        SearchableFactRecord(
-            id=str(r["id"]),
-            video_id=str(r["video_id"]),
-            frame_id=str(r["frame_id"]) if r["frame_id"] else None,
-            fact_text=r["fact_text"],
-            timestamp_s=r["timestamp_s"],
-            embedding=_vec_to_list(r["embedding"]),
-            pinecone_id=r["pinecone_id"],
-        )
-        for r in rows
-    ]
-    if not facts:
-        return 0
-    return await asyncio.to_thread(upsert_facts, facts)
-
-
-def clone_pinecone_scenes(source_id: str, new_id: str) -> int:
-    """Copy the 'scenes' namespace vectors for source_id -> new_id, new vector ids."""
-    index = get_index()
-    matches = []
-    # Pinecone has no "list by metadata" primitive on pod-free serverless without a
-    # query vector, so query with a zero vector + metadata filter and a large top_k.
-    resp = index.query(
-        vector=[0.0] * 1024,
-        filter={"video_id": {"$eq": source_id}},
-        top_k=10000,
-        include_values=True,
-        include_metadata=True,
-        namespace="scenes",
-    )
-    matches = resp.get("matches", []) if isinstance(resp, dict) else resp.matches
-    if not matches:
-        return 0
-    vectors = []
-    for m in matches:
-        md = dict(m["metadata"] if isinstance(m, dict) else m.metadata)
-        md["video_id"] = new_id
-        vectors.append({
-            "id": str(uuid.uuid4()),
-            "values": m["values"] if isinstance(m, dict) else m.values,
-            "metadata": md,
-        })
-    index.upsert(vectors=vectors, namespace="scenes")
-    return len(vectors)
-
-
-# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -393,18 +339,12 @@ async def clone_one(pool: asyncpg.Pool, source_id: str, new_id: str, dry_run: bo
     n_nodes, n_edges = await clone_neo4j(pool, new_id)
     logger.info("Neo4j clone %s: %d nodes, %d edges", new_id, n_nodes, n_edges)
 
-    n_facts = await clone_pinecone_facts(pool, new_id)
-    n_scenes = await asyncio.to_thread(clone_pinecone_scenes, source_id, new_id)
-    logger.info("Pinecone clone %s: %d fact vectors, %d scene vectors", new_id, n_facts, n_scenes)
-
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("source_video_id")
     ap.add_argument("--count", type=int, default=1)
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--resume-pinecone-only", metavar="NEW_VIDEO_ID", default=None,
-                     help="Skip Postgres/Neo4j clone; a target video_id already cloned in Postgres — just finish the Pinecone step for it.")
     args = ap.parse_args()
 
     pool = await get_pool()
@@ -412,13 +352,6 @@ async def main() -> None:
         exists = await pool.fetchval("SELECT 1 FROM videos WHERE id = $1", uuid.UUID(args.source_video_id))
         if not exists:
             logger.error("source video_id %s not found in Postgres — aborting", args.source_video_id)
-            return
-
-        if args.resume_pinecone_only:
-            new_id = args.resume_pinecone_only
-            n_facts = await clone_pinecone_facts(pool, new_id)
-            n_scenes = await asyncio.to_thread(clone_pinecone_scenes, args.source_video_id, new_id)
-            logger.info("Pinecone clone %s: %d fact vectors, %d scene vectors", new_id, n_facts, n_scenes)
             return
 
         new_ids = [str(uuid.uuid4()) for _ in range(args.count)]

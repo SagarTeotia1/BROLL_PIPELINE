@@ -396,7 +396,7 @@ async def run_pipeline(
         # L2 failure is non-fatal — L3 proceeds with empty person/appearance data
 
     # ------------------------------------------------------------------
-    # Level 3: Qwen3-VL 8B via vLLM → knowledge graph → PostgreSQL + Pinecone
+    # Level 3: Qwen3-VL 8B via vLLM → knowledge graph → PostgreSQL (pgvector)
     # ------------------------------------------------------------------
     await upsert_job(
         pool,

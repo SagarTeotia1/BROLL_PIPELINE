@@ -20,16 +20,71 @@ except ImportError:
     VLLM_AVAILABLE = False
     logger.warning("vLLM not installed — QwenVLLM will not function locally")
 
+try:
+    from vllm.sampling_params import GuidedDecodingParams  # type: ignore[import]
+except ImportError:
+    # Separate from the VLLM_AVAILABLE check above — a renamed/missing class
+    # here must not be mistaken for "vLLM isn't installed" (see the
+    # try/except around its use in _make_sampling_params for the fallback).
+    GuidedDecodingParams = None  # type: ignore[assignment,misc]
+
 
 MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 
 
 def _make_sampling_params() -> "SamplingParams":
-    return SamplingParams(
+    """Real-video failure found: free-text JSON generation produced
+    syntactically invalid output on several frames ("Expecting ',' delimiter"
+    at real character offsets deep in the response — a genuine malformed-JSON
+    bug, e.g. an unescaped character in a caption string breaking the parser,
+    not a truncation artifact). Prompt-only "reply with JSON" instructions
+    give the model no hard guarantee of valid syntax.
+
+    Fix: constrain decoding to QwenFrameOutput's JSON schema via vLLM's
+    guided decoding (xgrammar/outlines/llguidance are all already installed —
+    `structured_outputs_config=StructuredOutputsConfig(backend='auto', ...)`
+    is visible in the engine's own startup log). This makes invalid JSON
+    syntax structurally unreachable by the decoder, not just less likely.
+    """
+    from shared.types import QwenFrameOutput  # local import — avoid a hard
+    # dependency from this GPU-only module on the wider shared package at
+    # import time (this module must stay importable without vLLM installed).
+
+    base_kwargs = dict(
         temperature=0.0,  # greedy — fastest decoding, fully deterministic
         max_tokens=2048,  # some frames hit 1400-1500 tokens; 2048 is safe ceiling
         stop=None,
     )
+    if GuidedDecodingParams is None:
+        logger.error(
+            "vllm.sampling_params.GuidedDecodingParams not importable — "
+            "falling back to unconstrained generation. Structured-JSON "
+            "guarantee is NOT active; check vLLM 0.23's actual structured-"
+            "output API (possibly renamed — see StructuredOutputsConfig in "
+            "engine startup logs) and fix this call site."
+        )
+        return SamplingParams(**base_kwargs)
+    try:
+        guided = GuidedDecodingParams(json=QwenFrameOutput.model_json_schema())
+        return SamplingParams(guided_decoding=guided, **base_kwargs)
+    except TypeError as exc:
+        # vLLM 0.23's engine log shows `StructuredOutputsConfig`, not
+        # `GuidedDecodingConfig` — the SamplingParams field name may have
+        # been renamed in this version and this wasn't verified against the
+        # actual installed package (not available on the dev machine, only
+        # inside the Modal container). Degrade to unconstrained JSON rather
+        # than crash L3 on a naming mismatch — log loudly so it's visible
+        # and gets fixed for real, not silently swallowed forever.
+        logger.error(
+            "SamplingParams(guided_decoding=...) rejected (%s) — falling back "
+            "to unconstrained generation. Structured-JSON guarantee is NOT "
+            "active; malformed-JSON parse failures may recur. Check vLLM "
+            "0.23's actual structured-output API (possibly renamed to "
+            "`structured_outputs=` — see StructuredOutputsConfig in engine "
+            "startup logs) and fix this call site.",
+            exc,
+        )
+        return SamplingParams(**base_kwargs)
 
 
 def _strip_markdown_fences(raw: str) -> str:

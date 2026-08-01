@@ -53,17 +53,23 @@ import asyncpg
 from pydantic import ValidationError
 
 from knowledge_base.postgres.queries import (
+    get_client_style_profile,
     get_edit_plan,
     get_final_storyline_for_video,
     get_latest_edit_plan_for_video,
+    get_reward_signal,
     get_scenes_for_video,
+    get_top_scoring_scenes_for_client,
+    get_video,
     insert_edit_plan,
     insert_edit_plan_revision,
 )
+from pipeline.feedback.correction_logger import log_edit_plan_revision_correction
 from shared.config import settings
 from shared.types import (
     ApplyPlanRevisionOutput,
     BuildEditPlanOutput,
+    EditOperationItem,
     EditPlanRecord,
     EditPlanRevisionRecord,
     ScoreCandidateScenesOutput,
@@ -93,6 +99,11 @@ _SEQUENCING_MAX_TOKENS = 8192
 # CLAUDE.md rule 22 — duration-fit retries cap at 2-3 attempts, then a
 # programmatic fallback (never an unbounded LLM retry loop).
 _DURATION_CORRECTION_MAX_ATTEMPTS = 3
+
+# PIPELINE ADDENDUM 3, LEVEL 9, item 9b (reward -> few-shot injection).
+# Both numbers given literally in CLAUDE.md 9b's text.
+_CLIENT_STYLE_SAMPLE_FLOOR = 5
+_CLIENT_STYLE_EXAMPLE_LIMIT = 5
 _DEFAULT_DURATION_TOLERANCE_PCT = 10.0
 
 # Small, bounded retry for a transient Groq API failure (network blip,
@@ -124,14 +135,11 @@ _SELECT_CLIP = "SELECT_CLIP"
 
 
 def _get_groq_client():
-    if not settings.GROQ_API_KEY:
-        raise RuntimeError(
-            "GROQ_API_KEY is not configured — Level-5 Planning cannot run "
-            "without it (see shared/config.py)."
-        )
-    from groq import Groq  # local import — keeps this an optional dependency
+    """Name kept for minimal diff — actually returns an OpenRouter client
+    now (see shared/llm_client.py)."""
+    from shared.llm_client import get_llm_client
 
-    return Groq(api_key=settings.GROQ_API_KEY)
+    return get_llm_client()
 
 
 async def _call_groq_tool(
@@ -141,6 +149,10 @@ async def _call_groq_tool(
     tool_schema: dict,
     payload: dict,
     max_tokens: int,
+    *,
+    pool: asyncpg.Pool | None = None,
+    video_id: str | None = None,
+    stage: str | None = None,
 ) -> dict | None:
     """Call Groq's OpenAI-compatible `chat.completions.create` with a forced
     tool call and return the tool's structured arguments as a dict, or None
@@ -153,9 +165,12 @@ async def _call_groq_tool(
     `message.tool_calls[0].function.arguments` as a JSON STRING that must
     be `json.loads()`-ed before pydantic validation.
     """
+    import time as _time
+
     fn_name = tool_schema["function"]["name"]
     last_exc: Exception | None = None
     for attempt in range(1, _LLM_CALL_ATTEMPTS + 1):
+        _t0 = _time.monotonic()
         try:
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -167,8 +182,15 @@ async def _call_groq_tool(
                 ],
                 tools=[tool_schema],
                 tool_choice={"type": "function", "function": {"name": fn_name}},
+                # See pipeline/level4/grounding_runner.py::_call_tool for the
+                # real-video finding behind this — OpenRouter routes to
+                # multiple backend providers with inconsistent tool-calling
+                # reliability; this restricts routing to providers that
+                # declare full support for every param in this request.
+                extra_body={"provider": {"require_parameters": True}},
             )
             usage = getattr(response, "usage", None)
+            _latency_ms = int((_time.monotonic() - _t0) * 1000)
             if usage is not None:
                 logger.info(
                     "L5 planning LLM call model=%s tool=%s prompt_tokens=%s completion_tokens=%s",
@@ -177,6 +199,18 @@ async def _call_groq_tool(
                     getattr(usage, "prompt_tokens", "?"),
                     getattr(usage, "completion_tokens", "?"),
                 )
+            # L7 7c — durable cost/latency log, non-fatal.
+            from shared.llm_client import log_llm_call as _log_llm_call
+            await _log_llm_call(
+                pool,
+                video_id=video_id,
+                level=5,
+                stage=stage or "l5_planning",
+                model=model,
+                prompt_tokens=getattr(usage, "prompt_tokens", None) if usage is not None else None,
+                completion_tokens=getattr(usage, "completion_tokens", None) if usage is not None else None,
+                latency_ms=_latency_ms,
+            )
             choice = response.choices[0]
             tool_calls = getattr(choice.message, "tool_calls", None)
             if not tool_calls:
@@ -278,6 +312,7 @@ async def run_selection_pass(
         raw = await _call_groq_tool(
             client, settings.L5_SELECTION_MODEL, L5_SELECTION_SYSTEM_PROMPT,
             SCORE_CANDIDATE_SCENES_TOOL, payload, _SELECTION_MAX_TOKENS,
+            pool=pool, video_id=video_id, stage="l5_selection",
         )
         if raw is None:
             logger.error(
@@ -345,6 +380,9 @@ async def run_sequencing_pass(
     target_duration_s: float | None = None,
     platform: str | None = None,
     pacing_preference: str | None = None,
+    client_pacing_preference: str | None = None,
+    user_prompt: str | None = None,
+    client_style_examples: list[dict] | None = None,
 ) -> list[dict]:
     """Pass B: ONE Groq call turning Pass A's ranked/pruned candidates into
     the ordered `EditOperation[]` array. `pool`/`video_id` are accepted for
@@ -355,7 +393,37 @@ async def run_sequencing_pass(
     video length (CLAUDE.md: "context bounded regardless of source video
     length").
 
-    Returns the raw (not yet duration-corrected) operations list of dicts.
+    *client_pacing_preference* is the OPTIONAL soft prior from CLAUDE.md
+    "PIPELINE ADDENDUM 2" -> "3. Client Style Profiles" —
+    `client_style_profiles.pacing_preference` for this video's `client_id`,
+    when a profile row exists (looked up by the caller,
+    `run_level5_planning`, via `get_video` + `get_client_style_profile`).
+    Distinct from *pacing_preference* (the user's explicit per-edit
+    request): the two are never conflated, and the prompt itself (rule 26)
+    tells the model the explicit user request always wins on conflict.
+    Leaving this None (no profile, or no client_id on the video) reproduces
+    exactly today's prompt/behavior — additive, not required.
+
+    *client_style_examples* — CLAUDE.md "PIPELINE ADDENDUM 3" -> "LEVEL 9 —
+    REWARD & PUNISHMENT", item 9b: an OPTIONAL, bounded (<= 5, rule 23) list
+    of this client's best-reward-scored past scene summaries, looked up by
+    the caller (`run_level5_planning`) via `get_reward_signal(scope_type=
+    'client')` + `get_top_scoring_scenes_for_client` ONLY when that
+    reward_signals row has `sample_count >= 5`. Soft style prior only (rule
+    26) — never a source of grounded content, and an empty/None list (the
+    common case today — see 9b's live-data caveat) reproduces exactly
+    today's prompt/behavior.
+
+    *user_prompt* — real-video finding, first live L5 run: the user's raw
+    editing intent previously reached ONLY Pass A (relevance scoring), never
+    this pass, so an explicit structural instruction in the prompt itself
+    ("start with X, then Y, end with Z") had no channel to influence
+    ordering — Pass B ordered purely by causal_link_to_next + relevance,
+    producing a sequence that ignored the user's literal requested structure
+    even though Pass A had correctly scored the right scenes as relevant.
+    Passed through now so Pass B can honor explicit ordering language when
+    present; still subordinate to grounded data (rule 18 — L6/L5 don't
+    invent content, they sequence what Pass A already selected).
     """
     if not ranked_candidates:
         logger.warning(
@@ -370,25 +438,53 @@ async def run_sequencing_pass(
         "target_duration_s": target_duration_s,
         "platform": platform,
         "pacing_preference": pacing_preference,
+        "client_style_pacing_preference": client_pacing_preference,
+        "user_prompt": user_prompt,
+        # PIPELINE ADDENDUM 3, LEVEL 9, item 9b — soft style prior only
+        # (rule 26), see this function's docstring addition below and
+        # prompts/l5_sequencing.py. Empty list is the common case and must
+        # change nothing about how Pass B sequences.
+        "client_style_examples": client_style_examples or [],
     }
     raw = await _call_groq_tool(
         client, settings.L5_SEQUENCING_MODEL, L5_SEQUENCING_SYSTEM_PROMPT,
         BUILD_EDIT_PLAN_TOOL, payload, _SEQUENCING_MAX_TOKENS,
+        pool=pool, video_id=video_id, stage="l5_sequencing",
     )
     if raw is None:
         logger.error("run_sequencing_pass: video_id=%s LLM call failed", video_id)
         return []
 
-    try:
-        parsed = BuildEditPlanOutput.model_validate(raw)
-    except ValidationError as exc:
-        logger.error("run_sequencing_pass: video_id=%s failed to validate response: %s", video_id, exc)
+    # Per-item, not per-batch (same fix as L4's grounding_runner malformed-
+    # cluster handling): a single malformed op must not discard every other
+    # op in an otherwise-valid plan. Real-video finding: `BuildEditPlanOutput.
+    # model_validate(raw)` as one all-or-nothing call meant 3 dispatch ops
+    # missing sequence_index (correctly, per the prompt's own instruction —
+    # see EditOperationItem.sequence_index docstring) discarded an entire
+    # valid 18-op plan.
+    raw_ops = raw.get("operations", []) if isinstance(raw, dict) else []
+    if not isinstance(raw_ops, list):
+        logger.error(
+            "run_sequencing_pass: video_id=%s 'operations' missing or not a list in tool output",
+            video_id,
+        )
         return []
+    parsed_ops: list[EditOperationItem] = []
+    for i, item_raw in enumerate(raw_ops):
+        try:
+            parsed_ops.append(EditOperationItem.model_validate(item_raw))
+        except ValidationError as exc:
+            logger.error(
+                "run_sequencing_pass: video_id=%s dropping malformed op at index %d: %s | raw=%r",
+                video_id, i, exc, item_raw,
+            )
 
     known_scene_ids = {c["scene_id"] for c in ranked_candidates}
+    candidates_by_scene_id = {c["scene_id"]: c for c in ranked_candidates}
     operations: list[dict] = []
     n_dropped = 0
-    for op in parsed.operations:
+    n_backfilled = 0
+    for op in parsed_ops:
         if op.type not in _ALL_OP_TYPES:
             logger.warning(
                 "run_sequencing_pass: video_id=%s dropping op_id=%s with unknown type=%r",
@@ -404,11 +500,45 @@ async def run_sequencing_pass(
             )
             n_dropped += 1
             continue
-        operations.append(op.model_dump())
+        op_dict = op.model_dump()
+        if op.type == _SELECT_CLIP:
+            # Real-video finding, first live L5 run: the tool schema marks
+            # scene_id/start_time/end_time nullable (so the model can return
+            # a dispatch-only op), but the model sometimes omits them on a
+            # genuine SELECT_CLIP too, and validate_plan hard-rejects the
+            # WHOLE plan on the first such op — same failure class as
+            # several L4 real-video findings (don't trust the model to
+            # re-emit ground truth it was already given). Fix, same
+            # principle as story_architect_runner's "never trust the LLM's
+            # own start/end, use real data instead": a null scene_id is
+            # unrecoverable (nothing to look up) — drop the op. A present
+            # scene_id with null start_time/end_time IS recoverable — Pass
+            # A's ranked_candidates already carries that scene's real
+            # bounds, so backfill the full-clip span instead of discarding
+            # a perfectly valid selection over one missing field pair.
+            if op.scene_id is None:
+                logger.warning(
+                    "run_sequencing_pass: video_id=%s op_id=%s is SELECT_CLIP with no "
+                    "scene_id — unrecoverable, dropping",
+                    video_id, op.op_id,
+                )
+                n_dropped += 1
+                continue
+            if op.start_time is None or op.end_time is None:
+                candidate = candidates_by_scene_id[op.scene_id]
+                op_dict["start_time"] = candidate["start_time"]
+                op_dict["end_time"] = candidate["end_time"]
+                n_backfilled += 1
+                logger.info(
+                    "run_sequencing_pass: video_id=%s op_id=%s missing start_time/end_time — "
+                    "backfilled full scene span [%.2f, %.2f) from ranked_candidates",
+                    video_id, op.op_id, candidate["start_time"], candidate["end_time"],
+                )
+        operations.append(op_dict)
 
     logger.info(
-        "run_sequencing_pass: video_id=%s produced %d operations (%d dropped)",
-        video_id, len(operations), n_dropped,
+        "run_sequencing_pass: video_id=%s produced %d operations (%d dropped, %d backfilled)",
+        video_id, len(operations), n_dropped, n_backfilled,
     )
     return operations
 
@@ -509,6 +639,9 @@ async def enforce_duration(
     target_duration_s: float | None,
     ranked_candidates: list[dict] | None = None,
     tolerance_pct: float = _DEFAULT_DURATION_TOLERANCE_PCT,
+    *,
+    pool: asyncpg.Pool | None = None,
+    video_id: str | None = None,
 ) -> list[dict]:
     """Hard duration constraint, enforced programmatically (CLAUDE.md "Hard
     vs. soft constraints — don't trust the LLM with arithmetic"): sum
@@ -564,6 +697,7 @@ async def enforce_duration(
         raw = await _call_groq_tool(
             client, settings.L5_SEQUENCING_MODEL, L5_DURATION_CORRECTION_SYSTEM_PROMPT,
             BUILD_EDIT_PLAN_TOOL, payload, _SEQUENCING_MAX_TOKENS,
+            pool=pool, video_id=video_id, stage="l5_duration_correction",
         )
         if raw is None:
             logger.warning(
@@ -648,6 +782,12 @@ async def validate_plan(pool: asyncpg.Pool, video_id: str, operations: list[dict
             return f"SELECT_CLIP op {op.get('op_id')!r} is missing scene_id"
         if op.get("start_time") is None or op.get("end_time") is None:
             return f"SELECT_CLIP op {op.get('op_id')!r} is missing start_time/end_time"
+        if op.get("sequence_index") is None:
+            # sequence_index is optional at the schema level (dispatch ops
+            # legitimately omit it — see EditOperationItem docstring), but a
+            # SELECT_CLIP op needs a real int for the contiguity check below
+            # to even run; sorted() would TypeError on a mix of int/None.
+            return f"SELECT_CLIP op {op.get('op_id')!r} is missing sequence_index"
 
     scenes = await get_scenes_for_video(pool, video_id)
     scenes_by_id = {s.id: s for s in scenes}
@@ -743,8 +883,45 @@ async def run_level5_planning(
             "reason": "Pass A (Selection & Scoring) produced no ranked candidate scenes",
         }
 
+    # CLAUDE.md "PIPELINE ADDENDUM 2" -> "3. Client Style Profiles": additive,
+    # soft-prior-only lookup. A video with no client_id, or a client_id with
+    # no profile row, leaves client_pacing_preference as None — Pass B's
+    # prompt/behavior is then byte-for-byte what it was before this feature.
+    client_pacing_preference: str | None = None
+    video = await get_video(pool, video_id)
+    if video is not None and video.client_id:
+        profile = await get_client_style_profile(pool, video.client_id)
+        if profile is not None:
+            client_pacing_preference = profile.pacing_preference
+
+    # PIPELINE ADDENDUM 3, LEVEL 9, item 9b — reward -> few-shot injection.
+    # Additive, soft-prior-only (rule 26). A video with no client_id, or a
+    # client_id whose reward_signals(scope_type='client') row doesn't exist
+    # yet or has sample_count below the floor, leaves client_style_examples
+    # as an empty list — byte-for-byte the same prompt/behavior as before
+    # this feature. On real data today, no video has client_id set (see
+    # migration 016_client_style_profiles.sql's videos.client_id, still
+    # unpopulated) so this path is correct-and-wired but not yet reachable —
+    # honestly reflects the same state as client_pacing_preference above.
+    client_style_examples: list[dict] = []
+    if video is not None and video.client_id:
+        reward_signal = await get_reward_signal(pool, "client", video.client_id)
+        if reward_signal is not None and reward_signal.sample_count >= _CLIENT_STYLE_SAMPLE_FLOOR:
+            top_scenes = await get_top_scoring_scenes_for_client(
+                pool, video.client_id, limit=_CLIENT_STYLE_EXAMPLE_LIMIT
+            )
+            client_style_examples = [
+                {
+                    "canonical_scene_id": s["canonical_scene_id"],
+                    "summary": s["summary"],
+                    "emotional_arc": s["emotional_arc"],
+                }
+                for s in top_scenes
+            ]
+
     operations = await run_sequencing_pass(
-        pool, video_id, ranked, target_duration_s, platform, pacing_preference
+        pool, video_id, ranked, target_duration_s, platform, pacing_preference,
+        client_pacing_preference, user_prompt, client_style_examples,
     )
     if not operations:
         return {
@@ -752,7 +929,9 @@ async def run_level5_planning(
             "reason": "Pass B (Sequencing & Pacing) produced no usable operations",
         }
 
-    operations = await enforce_duration(operations, target_duration_s, ranked_candidates=ranked)
+    operations = await enforce_duration(
+        operations, target_duration_s, ranked_candidates=ranked, pool=pool, video_id=video_id,
+    )
 
     reason = await validate_plan(pool, video_id, operations)
     if reason is not None:
@@ -842,6 +1021,7 @@ async def apply_revision(pool: asyncpg.Pool, edit_plan_id: str, user_feedback: s
     raw = await _call_groq_tool(
         client, settings.L5_SEQUENCING_MODEL, L5_REVISION_SYSTEM_PROMPT,
         APPLY_PLAN_REVISION_TOOL, payload, _SEQUENCING_MAX_TOKENS,
+        pool=pool, video_id=plan.video_id, stage="l5_revision",
     )
     if raw is None:
         return {"ok": False, "reason": "revision LLM call failed"}
@@ -859,6 +1039,15 @@ async def apply_revision(pool: asyncpg.Pool, edit_plan_id: str, user_feedback: s
         id=gen_id(), edit_plan_id=edit_plan_id, user_feedback=user_feedback, diff_operations=diff_ops
     )
     await insert_edit_plan_revision(pool, revision)
+    await log_edit_plan_revision_correction(
+        pool,
+        video_id=plan.video_id,
+        edit_plan_id=edit_plan_id,
+        original_operations=plan.operations,
+        diff_operations=diff_ops,
+        correction_source="client",
+        reason=user_feedback,
+    )
 
     new_operations = _apply_diff(plan.operations, diff_ops)
     new_operations = _normalize_operations(new_operations)

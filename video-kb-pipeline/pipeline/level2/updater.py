@@ -13,14 +13,18 @@ from knowledge_base.postgres.queries import (
     bulk_insert_face_timeline_events,
     bulk_insert_speaker_turns,
     bulk_upsert_color_grades,
+    bulk_upsert_shot_mattes,
+    insert_pipeline_alert,
     upsert_color_grade,
     upsert_person,
+    upsert_shot_matte,
 )
 from shared.types import (
     ColorGradeRecord,
     FaceAppearanceRecord,
     FaceTimelineEvent,
     PersonRecord,
+    ShotMatteRecord,
     SpeakerTurnRecord,
 )
 
@@ -35,6 +39,7 @@ async def write_level2_to_kb(
     timeline_events: list[FaceTimelineEvent],
     color_grades: list[ColorGradeRecord],
     speaker_turns: list[SpeakerTurnRecord] | None = None,
+    shot_mattes: list[ShotMatteRecord] | None = None,
 ) -> None:
     """Persist all Level-2 analysis results to the knowledge base.
 
@@ -52,8 +57,12 @@ async def write_level2_to_kb(
                          (Stage 0). ``person_id`` on these still refers to the
                          pre-upsert UUIDs from ``run_face_analysis`` — remapped
                          below using the same table used for appearances/events.
+        shot_mattes:     Background-matte records from ``run_background_matting``
+                         (A1 — runs in parallel with color grading, no
+                         cross-references into the person-UUID remap above).
     """
     speaker_turns = speaker_turns or []
+    shot_mattes = shot_mattes or []
     # ------------------------------------------------------------------
     # 1. Upsert persons.
     #
@@ -220,7 +229,43 @@ async def write_level2_to_kb(
     )
 
     # ------------------------------------------------------------------
-    # 5. Insert speaker turns (Stage 0: diarization fused w/ face identity)
+    # 5. Upsert shot matte records (A1 — background matting, runs in
+    #    parallel with color grading) — bulk first, per-record fallback.
+    #    Same bulk-then-fallback strategy as color grades.
+    # ------------------------------------------------------------------
+    inserted_mattes = 0
+    if shot_mattes:
+        try:
+            await bulk_upsert_shot_mattes(pool, shot_mattes)
+            inserted_mattes = len(shot_mattes)
+        except Exception as bulk_exc:
+            logger.warning(
+                "bulk_upsert_shot_mattes failed for video %s (%s) — "
+                "falling back to per-record upserts.",
+                video_id,
+                bulk_exc,
+            )
+            for matte in shot_mattes:
+                try:
+                    await upsert_shot_matte(pool, matte)
+                    inserted_mattes += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to upsert shot matte shot_id=%s (video_id=%s): %s",
+                        matte.shot_id,
+                        video_id,
+                        exc,
+                    )
+
+    logger.info(
+        "Upserted %d/%d shot matte records for video %s",
+        inserted_mattes,
+        len(shot_mattes),
+        video_id,
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Insert speaker turns (Stage 0: diarization fused w/ face identity)
     #    — best-effort per record, bulk first, per-record fallback.
     # ------------------------------------------------------------------
     inserted_turns = 0
@@ -257,11 +302,47 @@ async def write_level2_to_kb(
 
     logger.info(
         "Level-2 KB write complete for video %s — "
-        "persons=%d appearances=%d timeline_events=%d color_grades=%d speaker_turns=%d",
+        "persons=%d appearances=%d timeline_events=%d color_grades=%d "
+        "shot_mattes=%d speaker_turns=%d",
         video_id,
         len(upserted_person_ids),
         len(appearances),
         len(timeline_events),
         inserted_grades,
+        inserted_mattes,
         inserted_turns,
     )
+
+    # ------------------------------------------------------------------
+    # 7. B4 observability — pyannote diarization failure signal.
+    #
+    #    Per CLAUDE.md B8's own framing: "L2 pyannote diarization fails ->
+    #    non-fatal -> speaker_turns empty for video". `run_diarization`
+    #    (pipeline/level2/diarization_runner.py) returns `[]` on every
+    #    failure path (audio extraction, pyannote import, model load,
+    #    inference) AND on legitimate "no speech detected" — the two are
+    #    not distinguishable from this function's inputs alone (that
+    #    would need a new return signal threaded up from
+    #    diarization_runner.py through modal_app.py, out of scope for this
+    #    pass). We approximate "likely a failure, not just a quiet video"
+    #    as: the video clearly has identified people on screen
+    #    (`persons` non-empty) but produced zero speaker_turns — a cast
+    #    video with visible people almost always has some dialogue.
+    # ------------------------------------------------------------------
+    if not speaker_turns and persons:
+        logger.warning(
+            "write_level2_to_kb: video_id=%s has %d persons but zero "
+            "speaker_turns — likely pyannote diarization failure "
+            "(pipeline_alerts).",
+            video_id, len(persons),
+        )
+        try:
+            await insert_pipeline_alert(
+                pool, video_id, 2, "l2_pyannote_zero_turns_with_persons",
+                0.0, 1.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "write_level2_to_kb: failed to write pipeline_alerts row for "
+                "video_id=%s: %s", video_id, exc,
+            )

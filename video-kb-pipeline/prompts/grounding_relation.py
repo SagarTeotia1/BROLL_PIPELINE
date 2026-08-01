@@ -17,7 +17,11 @@ You assign ONE canonical relation type to each cluster of near-duplicate
 free-text relation strings extracted from one video's frame analysis.
 
 Input:
-  clusters: [{cluster_id, raw_relations: [...]}, ...]
+  clusters: [{cluster_id, raw_relations: [...] (a representative sample of
+    up to 8 near-duplicate strings from this cluster, NOT the exhaustive
+    list — every member still gets mapped to your answer, only what's shown
+    to you is capped), total_count (the real number of members in this
+    cluster)}, ...]
   ontology: the current allowed canonical relations (below) — you may ONLY
     choose from this list, never invent a new one.
 

@@ -61,8 +61,8 @@ class LocalEmbedder:
             cls._instance = cls()
         return cls._instance
 
-    def load(self, model_name: str = "BAAI/bge-large-en-v1.5") -> None:
-        """Load the embedding model onto the GPU.
+    def load(self, model_name: str = "BAAI/bge-large-en-v1.5", device: str | None = None) -> None:
+        """Load the embedding model.
 
         Safe to call multiple times — subsequent calls are no-ops.
 
@@ -70,6 +70,13 @@ class LocalEmbedder:
             model_name: HuggingFace model identifier.  Defaults to
                 ``BAAI/bge-large-en-v1.5`` (1024-dim, best-in-class for
                 retrieval tasks, fits comfortably alongside Qwen on an L40S).
+            device: Torch device string. Defaults to None, which
+                auto-detects via ``torch.cuda.is_available()`` — this class
+                is used both in L3's GPU container (alongside Qwen) and in
+                L4's CPU-only container (``l4_image`` installs a CPU torch
+                wheel, per CLAUDE.md's own "CPU-only, no GPU" design for
+                L4) — hardcoding "cuda" here would crash the L4 container,
+                which has no CUDA device at all.
 
         Raises:
             RuntimeError: If sentence-transformers is not installed.
@@ -82,8 +89,11 @@ class LocalEmbedder:
         if self._model is not None:
             logger.debug("LocalEmbedder.load() called but model already loaded — skipping.")
             return
-        self._model = SentenceTransformer(model_name, device="cuda")
-        logger.info("LocalEmbedder loaded: %s (dim=%d)", model_name, EMBED_DIM)
+        if device is None:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._model = SentenceTransformer(model_name, device=device)
+        logger.info("LocalEmbedder loaded: %s (dim=%d, device=%s)", model_name, EMBED_DIM, device)
 
     def embed(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
         """Embed a list of texts, returning one 1024-dim vector per text.

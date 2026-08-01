@@ -9,13 +9,17 @@ caller (modal_app.py) marks the job FAILED with the specific reason string
 returned here — never a green checkmark over incomplete data.
 
 Postgres is the source of truth. Neo4j (canonical-relation edge correction)
-and Pinecone (canonical scenes + storylines projections) are written AFTER
-the completeness checks pass, as projections of that Postgres state — same
-"write Postgres first, project after" order kb_finalizer.py already uses for
-L3. Failures in those projection writes are logged and swallowed (non-fatal):
-Postgres correctness + `storylines.status` reaching `final` is what gates
-DONE, not that every downstream projection succeeded (CLAUDE.md "Write order
-in finalizer.py").
+is written AFTER the completeness checks pass, as a projection of that
+Postgres state — same "write Postgres first, project after" order
+kb_finalizer.py already uses for L3. Canonical scene / storyline embeddings
+are written directly to Postgres (`scenes.embedding` / `storylines.embedding`
+— B7 dropped Pinecone, pgvector is the only vector index now), so that step
+is no longer a separate "projection" in the Neo4j sense, but it still runs
+after the completeness checks and is still non-fatal on failure. Failures in
+these post-gate writes are logged and swallowed (non-fatal): Postgres
+correctness + `storylines.status` reaching `final` is what gates DONE, not
+that every downstream write succeeded (CLAUDE.md "Write order in
+finalizer.py").
 """
 from __future__ import annotations
 
@@ -30,6 +34,8 @@ from knowledge_base.postgres.queries import (
     get_latest_storyline,
     get_scenes_for_video,
     get_shots_for_video,
+    update_scene_embeddings,
+    update_storyline_embedding,
     update_storyline_status,
 )
 from shared.types import SceneRecord, StorylineRecord
@@ -169,7 +175,9 @@ async def _check_storyline(pool: asyncpg.Pool, video_id: str) -> tuple[str | Non
 
 
 # ---------------------------------------------------------------------------
-# Neo4j + Pinecone propagation (CLAUDE.md "Neo4j + Pinecone propagation")
+# Neo4j edge-type correction + pgvector embedding writes (CLAUDE.md "Neo4j +
+# Pinecone propagation" — Pinecone dropped per B7; scene/storyline embeddings
+# now write directly to Postgres instead of a separate vector store).
 # Non-fatal: logged and swallowed. Postgres correctness gates DONE, not this.
 # ---------------------------------------------------------------------------
 
@@ -205,7 +213,12 @@ async def _propagate_neo4j(video_id: str) -> None:
         logger.error("L4 finalizer: Neo4j canonical-relation propagation failed (non-fatal): %s", exc)
 
 
-async def _propagate_pinecone_scenes(pool: asyncpg.Pool, video_id: str) -> None:
+async def _write_scene_embeddings(pool: asyncpg.Pool, video_id: str) -> None:
+    """Embed each canonical scene's summary and write it to
+    `scenes.embedding` (B7 — replaces the Pinecone canonical-scenes
+    propagation pass; one vector per canonical scene, batched in groups of
+    100 per rule 8).
+    """
     try:
         scenes: list[SceneRecord] = await get_scenes_for_video(pool, video_id)
         if not scenes:
@@ -213,56 +226,37 @@ async def _propagate_pinecone_scenes(pool: asyncpg.Pool, video_id: str) -> None:
         summaries = [sc.summary or "" for sc in scenes]
         embeddings = await _embed_texts(summaries)
 
-        records = [
-            {
-                "id": f"{video_id}::{sc.canonical_scene_id}",
-                "video_id": video_id,
-                "canonical_scene_id": sc.canonical_scene_id,
-                "summary": sc.summary or "",
-                "embedding": emb,
-                "metadata": {
-                    "start_time": sc.start_time,
-                    "end_time": sc.end_time,
-                    "emotional_arc": sc.emotional_arc or "",
-                },
-            }
+        updates = [
+            (sc.id, emb)
             for sc, emb in zip(scenes, embeddings)
             if emb is not None
         ]
-        if not records:
+        if not updates:
             return
 
-        from knowledge_base.pinecone_kb.indexer import upsert_canonical_scenes  # type: ignore[import]
-
-        upserted = await asyncio.to_thread(upsert_canonical_scenes, records)
-        logger.info("L4 finalizer: upserted %d canonical scene vectors to Pinecone", upserted)
+        for i in range(0, len(updates), 100):
+            await update_scene_embeddings(pool, updates[i : i + 100])
+        logger.info("L4 finalizer: wrote %d canonical scene embeddings to Postgres", len(updates))
     except Exception as exc:
-        logger.error("L4 finalizer: Pinecone canonical-scenes propagation failed (non-fatal): %s", exc)
+        logger.error("L4 finalizer: scene embedding write failed (non-fatal): %s", exc)
 
 
-async def _propagate_pinecone_storyline(video_id: str, storyline: StorylineRecord) -> None:
+async def _write_storyline_embedding(pool: asyncpg.Pool, storyline: StorylineRecord) -> None:
+    """Embed the storyline synopsis and write it to `storylines.embedding`
+    (B7 — replaces the Pinecone storyline propagation pass; makes cross-video
+    plot/theme search possible via
+    `knowledge_base.postgres.queries.search_storylines_by_embedding`).
+    """
     try:
         embeddings = await _embed_texts([storyline.synopsis or ""])
         emb = embeddings[0] if embeddings else None
         if emb is None:
             return
 
-        record = {
-            "id": f"{video_id}::v{storyline.version}",
-            "video_id": video_id,
-            "storyline_id": storyline.id,
-            "version": storyline.version,
-            "title": storyline.title or "",
-            "synopsis": storyline.synopsis or "",
-            "embedding": emb,
-        }
-
-        from knowledge_base.pinecone_kb.indexer import upsert_storylines  # type: ignore[import]
-
-        upserted = await asyncio.to_thread(upsert_storylines, [record])
-        logger.info("L4 finalizer: upserted %d storyline vector(s) to Pinecone", upserted)
+        await update_storyline_embedding(pool, storyline.id, emb)
+        logger.info("L4 finalizer: wrote storyline embedding to Postgres (storyline_id=%s)", storyline.id)
     except Exception as exc:
-        logger.error("L4 finalizer: Pinecone storyline propagation failed (non-fatal): %s", exc)
+        logger.error("L4 finalizer: storyline embedding write failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -271,8 +265,9 @@ async def _propagate_pinecone_storyline(video_id: str, storyline: StorylineRecor
 
 
 async def finalize_level4(pool: asyncpg.Pool, video_id: str) -> dict:
-    """Run the L4 completeness gate and, if it passes, propagate to Neo4j /
-    Pinecone and flip the video's latest `storylines` row from draft -> final.
+    """Run the L4 completeness gate and, if it passes, propagate to Neo4j,
+    write scene/storyline embeddings to Postgres, and flip the video's
+    latest `storylines` row from draft -> final.
 
     Returns a dict:
       - {"ok": True, "storyline_version": int, "scenes_checked": int}
@@ -281,7 +276,7 @@ async def finalize_level4(pool: asyncpg.Pool, video_id: str) -> dict:
         (storylines.status is left untouched — still 'draft' or missing).
 
     Never raises for expected failure modes (a failing check, or a failing
-    projection write) — only for genuinely unexpected errors (e.g. the
+    post-gate write) — only for genuinely unexpected errors (e.g. the
     Postgres pool itself being unusable), which the caller (modal_app.py)
     catches and reports as the L4 job's FAILED error_msg.
     """
@@ -312,13 +307,14 @@ async def finalize_level4(pool: asyncpg.Pool, video_id: str) -> dict:
     )
 
     # ------------------------------------------------------------------
-    # 2. Projections — Postgres is already correct at this point; these are
-    #    best-effort mirrors. Failures here do NOT block finalization.
+    # 2. Neo4j edge-type correction + pgvector embedding writes — Postgres
+    #    scene/storyline rows already exist at this point; these are
+    #    best-effort enrichments. Failures here do NOT block finalization.
     # ------------------------------------------------------------------
     scenes = await get_scenes_for_video(pool, video_id)
     await _propagate_neo4j(video_id)
-    await _propagate_pinecone_scenes(pool, video_id)
-    await _propagate_pinecone_storyline(video_id, storyline)
+    await _write_scene_embeddings(pool, video_id)
+    await _write_storyline_embedding(pool, storyline)
 
     # ------------------------------------------------------------------
     # 3. Flip storylines.status draft -> final. This is the one write that

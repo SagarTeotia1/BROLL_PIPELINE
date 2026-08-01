@@ -1,7 +1,7 @@
 """Video Knowledge Base Dashboard — shows ALL data from every table/store.
 
 Run:
-    pip install streamlit plotly pandas pillow python-dotenv psycopg2-binary boto3 neo4j pinecone sentence-transformers
+    pip install streamlit plotly pandas pillow python-dotenv psycopg2-binary boto3 neo4j sentence-transformers
     streamlit run dashboard.py
 """
 from __future__ import annotations
@@ -170,6 +170,133 @@ def face_timeline(vid):
 
 
 @st.cache_data(ttl=_TTL_DATA)
+def storylines(vid):
+    return q("""
+        SELECT id, version, status, title, synopsis, cast_members, beats, created_at
+        FROM storylines WHERE video_id=%s::uuid ORDER BY version DESC
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def scenes(vid):
+    return q("""
+        SELECT id, canonical_scene_id, discarded_aliases, start_time, end_time,
+               participants, summary, emotional_arc, causal_link_to_next, usability_score,
+               (embedding IS NOT NULL) AS has_embedding
+        FROM scenes WHERE video_id=%s::uuid ORDER BY start_time
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def relation_canon_stats(vid):
+    return q("""
+        SELECT COALESCE(canonical_relation, '(uncanonicalized)') AS canonical_relation,
+               relation, COUNT(*) AS n
+        FROM kg_edges WHERE video_id=%s::uuid
+        GROUP BY canonical_relation, relation ORDER BY n DESC
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def edit_plans(vid):
+    return q("""
+        SELECT id, storyline_id, user_prompt, target_duration_s, platform, status, version,
+               operations, achieved_duration_s, created_at
+        FROM edit_plans WHERE video_id=%s::uuid ORDER BY created_at DESC
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def edit_plan_revisions(edit_plan_id):
+    return q("""
+        SELECT id, user_feedback, diff_operations, created_at
+        FROM edit_plan_revisions WHERE edit_plan_id=%s::uuid ORDER BY created_at
+    """, edit_plan_id)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def cut_list_items(edit_plan_id):
+    return q("""
+        SELECT id, op_id, sequence_index, source_start, source_end,
+               audio_lead_ms, video_lead_ms, transition
+        FROM cut_list_items WHERE edit_plan_id=%s::uuid ORDER BY sequence_index
+    """, edit_plan_id)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def sequence_color_adjustments(edit_plan_id):
+    return q("""
+        SELECT id, cut_list_item_id, base_parameters, sequence_delta, rationale
+        FROM sequence_color_adjustments WHERE edit_plan_id=%s::uuid
+    """, edit_plan_id)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def emphasis_and_layers(cut_list_item_ids):
+    if not cut_list_item_ids:
+        return [], []
+    emph = q(
+        "SELECT id, cut_list_item_id, effect_type, parameters, rationale "
+        "FROM emphasis_effects WHERE cut_list_item_id = ANY(%s::uuid[])",
+        list(cut_list_item_ids),
+    )
+    layers = q(
+        "SELECT id, cut_list_item_id, layer_type, source_ref, position, opacity, z_index "
+        "FROM layer_composites WHERE cut_list_item_id = ANY(%s::uuid[])",
+        list(cut_list_item_ids),
+    )
+    return emph, layers
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def qa_reports(edit_plan_id):
+    return q("""
+        SELECT id, status, deterministic_checks, llm_review, llm_status, created_at
+        FROM qa_reports WHERE edit_plan_id=%s::uuid ORDER BY created_at DESC
+    """, edit_plan_id)
+
+
+# L7 7d (CLAUDE.md "PIPELINE ADDENDUM 3" -> "LEVEL 7 -- EVALUATION" -> 7d,
+# "pipeline_alerts gets a consumer" -- closes audit gap #8, "write-only
+# log"). Raw rows for the selected video, newest first.
+@st.cache_data(ttl=_TTL_FAST)
+def pipeline_alerts(vid):
+    return q("""
+        SELECT id, level, alert_type, value, threshold, created_at
+        FROM pipeline_alerts WHERE video_id=%s::uuid ORDER BY created_at DESC
+    """, vid)
+
+
+# L7 7b (evaluation_scores) -- read alongside qa_reports in the L5/L6 tab.
+@st.cache_data(ttl=_TTL_DATA)
+def evaluation_scores(qa_report_id):
+    return q("""
+        SELECT id, intent_match, narrative_coherence, pacing_consistency,
+               technical_cleanliness, rationale, created_at
+        FROM evaluation_scores WHERE qa_report_id=%s::uuid ORDER BY created_at DESC LIMIT 1
+    """, qa_report_id)
+
+
+# L7 7c (llm_call_log) -- cost/latency audit, read in the L5/L6 tab.
+@st.cache_data(ttl=_TTL_DATA)
+def llm_call_log(vid):
+    return q("""
+        SELECT id, level, stage, model, prompt_tokens, completion_tokens,
+               cost_usd, latency_ms, created_at
+        FROM llm_call_log WHERE video_id=%s::uuid ORDER BY created_at DESC LIMIT 200
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
+def correction_events(vid):
+    return q("""
+        SELECT id, level, entity_type, entity_id, field, original_value, corrected_value,
+               correction_source, reason, created_at
+        FROM correction_events WHERE video_id=%s::uuid ORDER BY created_at DESC
+    """, vid)
+
+
+@st.cache_data(ttl=_TTL_DATA)
 def speaker_turns(vid):
     return q("""
         SELECT st.cluster_label, st.start_time, st.end_time, st.confidence,
@@ -236,7 +363,7 @@ def frame_analyses(vid):
 
 @st.cache_data(ttl=_TTL_HEAVY)
 def facts(vid, limit=500, offset=0):
-    return q("SELECT id, fact_text, timestamp_s, pinecone_id FROM searchable_facts "
+    return q("SELECT id, fact_text, timestamp_s, legacy_vector_id FROM searchable_facts "
              "WHERE video_id=%s::uuid ORDER BY timestamp_s LIMIT %s OFFSET %s",
              vid, limit, offset)
 
@@ -269,10 +396,26 @@ def kg_edges(vid, limit=2000):
     return rows
 
 
-@st.cache_resource
-def pinecone_idx():
-    from pinecone import Pinecone
-    return Pinecone(api_key=settings.PINECONE_API_KEY).Index(settings.PINECONE_INDEX_NAME)
+def vector_search(table: str, embedding: list[float], top_k: int, video_id: str | None = None):
+    """Cosine-similarity search directly against Postgres pgvector (B7 —
+    Pinecone dropped; `searchable_facts`/`scenes` both carry an `embedding`
+    column with an ivfflat index). `embedding` is passed as a `vector`
+    literal string since psycopg2 has no native pgvector adapter here.
+    """
+    vec_literal = "[" + ",".join(repr(float(x)) for x in embedding) + "]"
+    if video_id:
+        return q(
+            f"SELECT *, 1 - (embedding <=> %s::vector) AS score FROM {table} "
+            f"WHERE embedding IS NOT NULL AND video_id = %s::uuid "
+            f"ORDER BY embedding <=> %s::vector LIMIT %s",
+            vec_literal, video_id, vec_literal, top_k,
+        )
+    return q(
+        f"SELECT *, 1 - (embedding <=> %s::vector) AS score FROM {table} "
+        f"WHERE embedding IS NOT NULL "
+        f"ORDER BY embedding <=> %s::vector LIMIT %s",
+        vec_literal, vec_literal, top_k,
+    )
 
 
 @st.cache_resource
@@ -434,11 +577,12 @@ if st.sidebar.button("🔄 Clear cache"):
 _jobs = jobs(VID)
 jmap = {j["level"]: j for j in _jobs}
 icons = {"done": "🟢", "running": "🟡", "failed": "🔴", "queued": "⚪"}
-c1,c2,c3 = st.columns(3)
+c1,c2,c3,c4 = st.columns(4)
 for col, lvl, name in [
     (c1, 1, "L1 ASHFS+Whisper"),
     (c2, 2, "L2 Face+Color"),
     (c3, 3, "L3 Qwen+Graph"),
+    (c4, 4, "L4 Reasoning"),
 ]:
     j = jmap.get(lvl)
     col.metric(name, f"{icons.get(j['status'],'⚪')} {j['status'].upper()}" if j else "⚪ NOT RUN")
@@ -451,12 +595,12 @@ st.divider()
 T = st.tabs(["▶ Player", "📊 Overview", "🗂 Chunks", "🎬 Shots", "🖼 Keyframes",
              "📝 Transcript", "👤 Persons", "😊 Face Appearances", "😐 Emotions",
              "🗣 Diarization", "🎨 Color Grades", "🧠 Frame Analysis", "💡 Facts", "🕸 KG Nodes",
-             "🔗 KG Edges", "🌐 Neo4j", "🔍 Search"])
+             "🔗 KG Edges", "🌐 Neo4j", "🎭 L4 Reasoning", "🎯 L5/L6 Edit Plan", "🔍 Search"])
 
 (tab_player, tab_overview, tab_chunks, tab_shots, tab_kf,
  tab_trans, tab_persons, tab_faces, tab_emotions,
  tab_diarization, tab_color, tab_analysis, tab_facts, tab_kgnodes,
- tab_kgedges, tab_neo4j, tab_search) = T
+ tab_kgedges, tab_neo4j, tab_l4, tab_l5l6, tab_search) = T
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1226,7 +1370,7 @@ with tab_facts:
         facts_limit = c2.number_input("Limit", 50, 2000, 500, step=50, key="facts_lim")
 
         if search:
-            _f = q("SELECT id, fact_text, timestamp_s, pinecone_id FROM searchable_facts "
+            _f = q("SELECT id, fact_text, timestamp_s, legacy_vector_id FROM searchable_facts "
                    "WHERE video_id=%s::uuid AND fact_text ILIKE %s ORDER BY timestamp_s LIMIT %s",
                    VID, f"%{search}%", facts_limit)
         else:
@@ -1236,7 +1380,7 @@ with tab_facts:
         df = pd.DataFrame([{
             "Time": ft(f["timestamp_s"]),
             "Fact": f["fact_text"],
-            "Pinecone ID": f.get("pinecone_id") or "—",
+            "Legacy Vector ID": f.get("legacy_vector_id") or "—",
         } for f in _f])
         st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -1570,15 +1714,390 @@ with tab_neo4j:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 🎭 L4 REASONING (Grounding Agent + Story Architect Agent)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_l4:
+    st.header("Level 4 — Reasoning")
+    st.caption(
+        "Grounding Agent (speaker resolution + relation canonicalization) + "
+        "Story Architect Agent (scenes + storyline). Status here is derived from "
+        "`storylines.status` directly, not `processing_jobs` — a video run via "
+        "the bare `run_level4_modal` Modal function (not the full orchestrator) "
+        "never gets a `processing_jobs(level=4)` row, so that table alone can't "
+        "be trusted as the source of truth for this tab."
+    )
+
+    _sl = storylines(VID)
+    _sc = scenes(VID)
+    _st_turns = speaker_turns(VID)
+    _rel_stats = relation_canon_stats(VID)
+
+    # ── Finalization gate status (derived, not read from processing_jobs) ──
+    _final = next((s for s in _sl if s["status"] == "final"), None)
+    _draft = next((s for s in _sl if s["status"] == "draft"), None)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Storyline status", "🟢 FINAL" if _final else ("🟡 DRAFT" if _draft else "⚪ NOT RUN"))
+    col2.metric("Scenes", len(_sc))
+    n_unterminal = sum(1 for t in _st_turns if t["resolution_method"] in ("unresolved", "face_majority"))
+    col3.metric("Speaker turns unresolved", n_unterminal, help="Must be 0 for finalizer to pass")
+    other_n = sum(r["n"] for r in _rel_stats if r["canonical_relation"] in ("OTHER", "(uncanonicalized)"))
+    total_rel = sum(r["n"] for r in _rel_stats) or 1
+    col4.metric("OTHER-bucket relations", f"{other_n} ({other_n/total_rel:.1%})",
+                help="Alert threshold ~5% — CLAUDE.md B4")
+
+    st.divider()
+
+    # ── Storylines ──
+    st.subheader("Storylines")
+    if not _sl:
+        st.info("No storylines row — Story Architect Agent has not run for this video.")
+    else:
+        for s in _sl:
+            badge = "🟢 final" if s["status"] == "final" else "🟡 draft"
+            with st.expander(f"v{s['version']} · {badge} · {s.get('title') or '(untitled)'}", expanded=(s is _final or (s is _draft and not _final))):
+                st.markdown(f"**Synopsis:** {s.get('synopsis') or '—'}")
+                cm = s.get("cast_members") or {}
+                if cm:
+                    st.caption("Cast: " + ", ".join(f"{k} = {v}" for k, v in cm.items()))
+                beats = s.get("beats") or []
+                st.caption(f"{len(beats)} beat(s)")
+                if beats:
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(beats), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Scenes (canonical timeline) ──
+    st.subheader("Scenes (canonical timeline)")
+    if not _sc:
+        st.info("No scenes.")
+    else:
+        import pandas as pd, plotly.express as px
+
+        df = pd.DataFrame([{
+            "Scene": sc["canonical_scene_id"],
+            "Start": sc["start_time"],
+            "End": sc["end_time"],
+            "Duration (s)": round((sc["end_time"] or 0) - (sc["start_time"] or 0), 2),
+            "Participants": ", ".join(sc.get("participants") or []),
+            "Usability": round(sc["usability_score"], 2) if sc.get("usability_score") is not None else "—",
+            "Aliases discarded": ", ".join(sc.get("discarded_aliases") or []),
+            "Embedded": "✓" if sc.get("has_embedding") else "—",
+        } for sc in _sc])
+
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        fig = px.timeline(df, x_start="Start", x_end="End", y="Scene",
+            title="Canonical scene timeline (coverage check — gaps here = finalizer would have failed)",
+            hover_data=["Participants", "Usability"])
+        fig.update_xaxes(title="Time (s)")
+        fig.update_layout(height=max(260, 24 * len(df)))
+        st.plotly_chart(fig, use_container_width=True)
+
+        for sc in _sc:
+            with st.expander(f"{ft(sc['start_time'])}–{ft(sc['end_time'])} · {sc['canonical_scene_id']}"):
+                st.markdown(f"**Summary:** {sc.get('summary') or '—'}")
+                st.markdown(f"**Emotional arc:** {sc.get('emotional_arc') or '—'}")
+                st.markdown(f"**Causal link to next:** {sc.get('causal_link_to_next') or '—'}")
+
+    st.divider()
+
+    # ── Relation canonicalization (grounding 1b) ──
+    st.subheader("Relation canonicalization (Grounding Agent, 1b)")
+    if not _rel_stats:
+        st.info("No kg_edges for this video.")
+    else:
+        import pandas as pd, plotly.express as px
+        df = pd.DataFrame(_rel_stats)
+        canon_agg = df.groupby("canonical_relation")["n"].sum().reset_index().sort_values("n", ascending=False)
+        st.plotly_chart(px.bar(canon_agg, x="canonical_relation", y="n",
+            title="Edges by canonical relation (watch OTHER / uncanonicalized share)",
+            height=300), use_container_width=True)
+        with st.expander("Raw relation strings -> canonical mapping"):
+            st.dataframe(df.rename(columns={"n": "count"}), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Speaker turn resolution (grounding 1a) ──
+    st.subheader("Speaker turn resolution (Grounding Agent, 1a)")
+    if not _st_turns:
+        st.info("No speaker_turns for this video (L2 diarization non-fatal — may have produced nothing).")
+    else:
+        import pandas as pd, plotly.express as px
+        df = pd.DataFrame([{
+            "Resolution": t["resolution_method"],
+            "Speaker": t.get("display_name") or t.get("pid") or "—",
+        } for t in _st_turns])
+        res_cnt = df["Resolution"].value_counts().reset_index()
+        res_cnt.columns = ["Resolution", "Count"]
+        st.plotly_chart(px.bar(res_cnt, x="Resolution", y="Count", color="Resolution",
+            title="Turns by resolution method — llm_tiebreak/llm_unresolved_final are L4's own contribution",
+            height=260), use_container_width=True)
+        st.caption("Full per-turn view is in the 🗣 Diarization tab.")
+
+    st.divider()
+
+    # ── L7 7d: pipeline_alerts consumer (CLAUDE.md "PIPELINE ADDENDUM 3" ->
+    # "LEVEL 7 -- EVALUATION" -> 7d) — closes audit gap #8, "write-only log".
+    # `pipeline_alerts` was already written to (L4's OTHER-bucket rate,
+    # llm_unresolved_final rate, etc. — see the OTHER-bucket metric above)
+    # but nothing read it back until now. ──
+    st.subheader("⚠️ Pipeline alerts")
+    st.caption(
+        "Raw `pipeline_alerts` rows for this video — written by each level's "
+        "finalizer/updater when a threshold trips (CLAUDE.md B4). Rows where "
+        "`value > threshold` are flagged red."
+    )
+    _alerts = pipeline_alerts(VID)
+    if not _alerts:
+        st.info("No pipeline_alerts rows for this video.")
+    else:
+        import pandas as pd
+
+        _adf = pd.DataFrame([{
+            "Level": a["level"],
+            "Alert type": a["alert_type"],
+            "Value": a["value"],
+            "Threshold": a["threshold"],
+            "Breached": (a["value"] is not None and a["threshold"] is not None and a["value"] > a["threshold"]),
+            "Created": a["created_at"],
+        } for a in _alerts])
+
+        def _highlight_breach(row):
+            color = "background-color: rgba(220, 53, 69, 0.35)" if row["Breached"] else ""
+            return [color] * len(row)
+
+        st.dataframe(
+            _adf.style.apply(_highlight_breach, axis=1),
+            use_container_width=True, hide_index=True,
+        )
+        n_breached = int(_adf["Breached"].sum())
+        if n_breached:
+            st.warning(f"{n_breached} of {len(_adf)} alert(s) breached their threshold.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🎯 L5/L6 — EDIT PLAN (Planning + Action Agents)
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_l5l6:
+    st.header("Level 5/6 — Edit Plan, Cut List, Color/QA")
+    st.caption(
+        "L5 (`scripts/run_l5.py`) writes `edit_plans`; L6 (`scripts/run_l6.py`) reads a "
+        "finalized plan and writes `cut_list_items` / `sequence_color_adjustments` / "
+        "`qa_reports` + the rendered file. Neither has Modal wiring yet — both run as "
+        "local CLI scripts (see CLAUDE.md L5/L6 STATUS notes)."
+    )
+
+    _plans = edit_plans(VID)
+    if not _plans:
+        st.info(
+            "No edit_plans for this video yet. Run:\n\n"
+            "`python scripts/run_l5.py --video-id " + VID + " --prompt \"...\" --platform full_cut`"
+        )
+    else:
+        plan_labels = {
+            f"v{p['version']} · {p['status']} · {(p['user_prompt'] or '')[:60]}": p
+            for p in _plans
+        }
+        sel_label = st.selectbox("Edit plan", list(plan_labels.keys()), key="l5_plan_sel")
+        plan = plan_labels[sel_label]
+
+        col1, col2, col3, col4 = st.columns(4)
+        badge = {"draft": "🟡", "reviewed": "🔵", "applied": "🟢", "superseded": "⚪"}.get(plan["status"], "⚪")
+        col1.metric("Status", f"{badge} {plan['status'].upper()}")
+        col2.metric("Platform", plan.get("platform") or "—")
+        col3.metric("Target duration", f"{plan['target_duration_s']:.1f}s" if plan.get("target_duration_s") else "—")
+        col4.metric("Achieved duration", f"{plan['achieved_duration_s']:.1f}s" if plan.get("achieved_duration_s") else "—")
+
+        st.markdown(f"**User prompt:** {plan.get('user_prompt') or '—'}")
+
+        st.divider()
+
+        # ── Operations (raw EditPlan from L5 Pass B) ──
+        st.subheader("Operations (L5 output)")
+        ops = plan.get("operations") or []
+        if not ops:
+            st.info("No operations in this plan.")
+        else:
+            import pandas as pd
+            op_rows = []
+            for op in ops:
+                op_rows.append({
+                    "op_id": op.get("op_id"),
+                    "type": op.get("type"),
+                    "seq": op.get("sequence_index"),
+                    "scene_id": op.get("scene_id"),
+                    "start": op.get("start_time"),
+                    "end": op.get("end_time"),
+                    "transition_in": op.get("transition_in"),
+                    "rationale": (op.get("rationale") or "")[:100],
+                })
+            df_ops = pd.DataFrame(op_rows).sort_values("seq", na_position="last")
+            st.dataframe(df_ops, use_container_width=True, hide_index=True)
+            with st.expander("Raw operations JSON"):
+                st.json(ops)
+
+        # ── Revisions (diffs, not regenerates — rule 21) ──
+        _revs = edit_plan_revisions(plan["id"])
+        st.subheader(f"Revisions ({len(_revs)})")
+        if not _revs:
+            st.caption("No revisions — plan has not been through a feedback round.")
+        else:
+            for r in _revs:
+                with st.expander(f"{r['created_at']} · {(r['user_feedback'] or '')[:60]}"):
+                    st.markdown(f"**Feedback:** {r.get('user_feedback') or '—'}")
+                    st.json(r.get("diff_operations") or {})
+
+        st.divider()
+
+        # ── Cut list (L6 Editing Director output) ──
+        st.subheader("Cut list (L6 Editing Director)")
+        _cli = cut_list_items(plan["id"])
+        if not _cli:
+            st.info("No cut_list_items — L6 hasn't run for this plan yet (`scripts/run_l6.py`).")
+        else:
+            import pandas as pd
+            df_cl = pd.DataFrame([{
+                "Seq": c["sequence_index"],
+                "op_id": c["op_id"],
+                "Source start": c["source_start"],
+                "Source end": c["source_end"],
+                "Duration (s)": round((c["source_end"] or 0) - (c["source_start"] or 0), 2),
+                "Transition": c["transition"],
+                "Audio lead (ms)": c["audio_lead_ms"],
+                "Video lead (ms)": c["video_lead_ms"],
+            } for c in _cli])
+            st.dataframe(df_cl, use_container_width=True, hide_index=True)
+
+            cli_ids = [c["id"] for c in _cli]
+
+            # ── Sequence color adjustments ──
+            _sca = sequence_color_adjustments(plan["id"])
+            st.subheader("Sequence color adjustments")
+            if not _sca:
+                st.caption("No sequence_color_adjustments for this plan.")
+            else:
+                for a in _sca:
+                    with st.expander(f"cut_list_item={a['cut_list_item_id']} · {(a.get('rationale') or '')[:60]}"):
+                        c1, c2 = st.columns(2)
+                        c1.markdown("**Base parameters**")
+                        c1.json(a.get("base_parameters") or {})
+                        c2.markdown("**Sequence delta (harmonization)**")
+                        c2.json(a.get("sequence_delta") or {})
+                        st.caption(a.get("rationale") or "—")
+
+            # ── Emphasis effects + layer composites ──
+            _emph, _layers = emphasis_and_layers(cli_ids)
+            st.subheader(f"Emphasis effects ({len(_emph)}) / Layer composites ({len(_layers)})")
+            if not _emph and not _layers:
+                st.caption("None for this plan (A4/A5 compositing features — Addendum 1).")
+            else:
+                import pandas as pd
+                if _emph:
+                    st.markdown("**Emphasis (zoom/highlight)**")
+                    st.dataframe(pd.DataFrame([{
+                        "cut_list_item_id": e["cut_list_item_id"], "type": e["effect_type"],
+                        "parameters": json.dumps(e["parameters"]), "rationale": e.get("rationale") or "—",
+                    } for e in _emph]), use_container_width=True, hide_index=True)
+                if _layers:
+                    st.markdown("**Layer composites (PiP/background-swap/overlay)**")
+                    st.dataframe(pd.DataFrame([{
+                        "cut_list_item_id": l["cut_list_item_id"], "layer_type": l["layer_type"],
+                        "opacity": l["opacity"], "z_index": l["z_index"],
+                    } for l in _layers]), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── QA reports (L6 tail) ──
+        st.subheader("QA reports")
+        _qa = qa_reports(plan["id"])
+        if not _qa:
+            st.info("No qa_reports — QA Agent runs as the final step of `run_level6`.")
+        else:
+            for r in _qa:
+                qa_badge = {"pass": "🟢", "warn": "🟡", "fail": "🔴"}.get(r["status"], "⚪")
+                with st.expander(f"{qa_badge} {r['status'].upper()} · {r['created_at']}", expanded=(r is _qa[0])):
+                    c1, c2 = st.columns(2)
+                    c1.markdown("**Deterministic checks**")
+                    c1.json(r.get("deterministic_checks") or {})
+                    c2.markdown(f"**LLM review** ({r.get('llm_status') or '—'})")
+                    c2.write(r.get("llm_review") or "—")
+                    if r["status"] == "fail":
+                        st.error("QA gate FAILED — this report blocks delivery per rule 24 (QA reports, never edits).")
+
+                    # L7 7b: evaluation_scores rubric, additive to qa_status
+                    # (rule 27) — shown here, never affects the badge above.
+                    _scores = evaluation_scores(r["id"])
+                    if _scores:
+                        s = _scores[0]
+                        st.markdown("**Rubric scores (L7 7b, additive — never gates delivery)**")
+                        sc1, sc2, sc3, sc4 = st.columns(4)
+                        sc1.metric("Intent match", f"{s['intent_match']:.1f}/10" if s['intent_match'] is not None else "—")
+                        sc2.metric("Narrative coherence", f"{s['narrative_coherence']:.1f}/10" if s['narrative_coherence'] is not None else "—")
+                        sc3.metric("Pacing consistency", f"{s['pacing_consistency']:.1f}/10" if s['pacing_consistency'] is not None else "—")
+                        sc4.metric("Technical cleanliness", f"{s['technical_cleanliness']:.1f}/10" if s['technical_cleanliness'] is not None else "—")
+                        with st.expander("Rubric rationale"):
+                            st.json(s.get("rationale") or {})
+
+    st.divider()
+
+    # ── Correction events (feedback loop, Addendum 2) ──
+    st.subheader("Correction events (feedback loop)")
+    _ce = correction_events(VID)
+    if not _ce:
+        st.caption("No correction_events for this video — no human correction has been logged yet.")
+    else:
+        import pandas as pd
+        st.dataframe(pd.DataFrame([{
+            "Level": c["level"], "Entity": c["entity_type"], "Field": c["field"],
+            "Source": c["correction_source"], "Reason": c.get("reason") or "—",
+            "At": c["created_at"],
+        } for c in _ce]), use_container_width=True, hide_index=True)
+        with st.expander("Before / after values"):
+            for c in _ce:
+                st.markdown(f"**{c['entity_type']}.{c['field']}** ({c['correction_source']})")
+                cc1, cc2 = st.columns(2)
+                cc1.json(c.get("original_value"))
+                cc2.json(c.get("corrected_value"))
+
+    st.divider()
+
+    # ── L7 7c: llm_call_log cost/latency audit ──
+    st.subheader("LLM call log (cost/latency, L7 7c)")
+    _calls = llm_call_log(VID)
+    if not _calls:
+        st.caption("No llm_call_log rows for this video yet.")
+    else:
+        import pandas as pd
+        _cdf = pd.DataFrame([{
+            "Level": c["level"], "Stage": c["stage"], "Model": c["model"],
+            "Prompt tok": c["prompt_tokens"], "Completion tok": c["completion_tokens"],
+            "Cost $": c["cost_usd"], "Latency ms": c["latency_ms"], "At": c["created_at"],
+        } for c in _calls])
+        total_cost = _cdf["Cost $"].dropna().sum()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Calls logged", len(_cdf))
+        m2.metric("Total cost (known models)", f"${total_cost:.4f}")
+        m3.metric("Avg latency", f"{_cdf['Latency ms'].dropna().mean():.0f} ms" if _cdf["Latency ms"].notna().any() else "—")
+        st.dataframe(_cdf, use_container_width=True, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 🔍 SEARCH
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_search:
-    st.header("Semantic Search — Pinecone")
+    st.header("Semantic Search — pgvector")
+    st.caption(
+        "Cosine search directly against Postgres (`searchable_facts.embedding` / "
+        "`scenes.embedding`, both ivfflat-indexed). Pinecone was dropped per B7 — "
+        "pgvector is the only vector index now."
+    )
 
-    col1, col2, col3 = st.columns([4, 1, 1])
+    col1, col2, col3, col4 = st.columns([4, 1, 1, 1])
     query = col1.text_input("Query", placeholder="red curtain, three men, nervous expression...")
     top_k = col2.number_input("Top K", 1, 50, 10)
-    ns = col3.radio("Namespace", ["facts", "scenes"])
+    table_choice = col3.radio("Table", ["facts", "scenes"])
+    scope_this_video = col4.checkbox("This video only", value=False)
 
     if query:
         try:
@@ -1586,24 +2105,25 @@ with tab_search:
                 from models.embed_model import LocalEmbedder
                 vec = LocalEmbedder.get().embed([query], batch_size=1)[0]
 
-            with st.spinner("Querying Pinecone..."):
-                resp = pinecone_idx().query(vector=vec, top_k=top_k, namespace=ns, include_metadata=True)
+            table = "searchable_facts" if table_choice == "facts" else "scenes"
+            with st.spinner("Querying Postgres (pgvector)..."):
+                rows = vector_search(
+                    table, vec, top_k,
+                    video_id=VID if scope_this_video else None,
+                )
 
-            matches = resp.get("matches", [])
-            st.success(f"{len(matches)} results from namespace `{ns}`")
+            st.success(f"{len(rows)} results from `{table}`")
 
-            for i, m in enumerate(matches):
-                meta = m.get("metadata", {})
-                score = m.get("score", 0)
-                ts = ft(meta.get("timestamp_s"))
-                text = meta.get("fact_text") or meta.get("caption") or "—"
+            for r in rows:
+                ts = ft(r.get("timestamp_s") or r.get("start_time"))
+                text = r.get("fact_text") or r.get("summary") or "—"
+                score = r.get("score", 0) or 0
 
                 col_s, col_t, col_i = st.columns([1, 6, 2])
                 col_s.metric("Score", f"{score:.4f}")
                 col_t.markdown(f"**{text}**")
                 col_i.caption(f"t={ts}")
-                if meta.get("video_id"):
-                    st.caption(f"video: `{meta['video_id'][:8]}…` · frame: `{meta.get('frame_id','')[:8]}…`")
+                st.caption(f"video: `{str(r.get('video_id',''))[:8]}…`")
                 st.divider()
 
         except ImportError:

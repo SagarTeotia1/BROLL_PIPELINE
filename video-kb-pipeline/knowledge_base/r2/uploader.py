@@ -103,6 +103,40 @@ def upload_json(data: dict, video_id: str, name: str) -> str:
 
 
 @retry(max_attempts=3, wait_seconds=2.0)
+def upload_shot_matte(local_path: str, video_id: str, shot_id: str) -> str:
+    """Upload a shot's alpha-matte mp4 to R2 and return its object key.
+
+    Level-2 background matting (see ``pipeline/level2/matting_runner.py``
+    and CLAUDE.md PIPELINE ADDENDUM A1). The key follows the same
+    ``videos/{video_id}/...`` convention as ``upload_frame``/``upload_manifest``
+    (rule 5: consistent, queryable R2 key format)::
+
+        videos/{video_id}/mattes/{shot_id}.mp4
+
+    Args:
+        local_path: Path to the locally-encoded alpha-matte mp4 file.
+        video_id: The video's unique identifier.
+        shot_id: The shot's unique identifier (UUID string).
+
+    Returns:
+        The R2 object key for the uploaded matte.
+    """
+    key = f"videos/{video_id}/mattes/{shot_id}.mp4"
+    client = get_r2_client()
+    bucket = get_bucket_name()
+
+    with open(local_path, "rb") as f:
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=f,
+            ContentType="video/mp4",
+        )
+    logger.debug("Uploaded shot matte → %s", key)
+    return key
+
+
+@retry(max_attempts=3, wait_seconds=2.0)
 def download_bytes(key: str) -> bytes:
     """Download an object from R2 and return its raw bytes.
 

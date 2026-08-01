@@ -11,7 +11,6 @@ dependencies = [
     "pydantic-settings>=2.4",
     "asyncpg>=0.29",
     "pgvector>=0.3",
-    "pinecone>=3.0",
     "boto3>=1.35",
     "modal>=0.64",
     "faster-whisper>=1.0",
@@ -25,8 +24,14 @@ dependencies = [
     "nanoid>=2.0",
     "neo4j>=5.0",
     "pyannote.audio>=3.1",
-    "groq>=0.11",  # Level-4 (Grounding + Story Architect) and Level-5 (Selection + Sequencing) agents — see pipeline/level4/, pipeline/level5/.
+    "openai>=1.50",  # L4-L6 reasoning/planning/agent calls via OpenRouter — see shared/llm_client.py.
+    "groq>=0.11",  # optional fallback provider, not used by default — see shared/llm_client.py.
+    "requests>=2.31",  # A2 Pexels stock-asset client — see knowledge_base/stock_assets/client.py.
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

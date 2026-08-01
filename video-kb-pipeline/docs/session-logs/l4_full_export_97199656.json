@@ -1,0 +1,1218 @@
+{
+  "video_id": "97199656-d176-46aa-88b4-026670be4576",
+  "exported_at": "2026-07-31T06:07:52.951602Z",
+  "source": "Level 4 (Grounding Agent + Story Architect Agent), first live run, model=deepseek/deepseek-v3.2 via OpenRouter",
+  "video_meta": {
+    "id": "97199656-d176-46aa-88b4-026670be4576",
+    "path": "https://r2.sagarteotia.in/input%20video.mp4",
+    "r2_key": null,
+    "duration_s": 145.12,
+    "fps": 25.0,
+    "width": 1920,
+    "height": 1080,
+    "created_at": "2026-07-28T14:47:56.830432+00:00"
+  },
+  "l4_finalization": {
+    "storyline_final": true,
+    "shots_total": 73,
+    "kg_edges_total": 2683,
+    "kg_edges_other_bucket": 223,
+    "kg_edges_other_bucket_pct": 0.0831
+  },
+  "storylines": [
+    {
+      "id": "1bb8004b-e5f3-485a-a6d9-3896b9b6758f",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "version": 1,
+      "status": "final",
+      "title": "Netflix Promotional Skit for India's Got Latent Season 2",
+      "synopsis": "The video opens with a cast celebrating and debating Netflix's features while promoting an upcoming season, culminating in the announcement of \"India's Got Latent Season 2\". This leads to a series of title cards and \"COMING SOON\" graphics building anticipation for the new season. The video then transitions through dramatic Netflix brand animations and a red curtain opening, before ending with subscription prompt screens.",
+      "cast_members": "{\"P1\": \"Samay Raina\", \"P2\": \"Balraj\", \"P3\": \"BodyGaurd\", \"P4\": \"Netflix Guy\"}",
+      "beats": "[{\"summary\": \"The video opens with a black screen, then shows a person writing 'Season 2 coming soon' on a cartoon heart cutout in a Netflix office as others react joyfully. The cast engages in discussions about Netflix's value, lack of comment sections, and unfiltered content, interspersed with cooking show segments and promotional gestures with lemons and chilies. The scene culminates with a man on stage before red curtains announcing 'India's God Late' Season 2 and a future special, followed by the cast holding firecrackers amidst confetti.\", \"end_time\": 127.44, \"start_time\": 0.0, \"participants\": [\"P1\", \"P2\", \"P3\", \"P4\"], \"emotional_arc\": \"Playful celebration shifts to confrontational debate about Netflix's features, then returns to lighthearted promotion and culminates in celebratory anticipation.\", \"canonical_scene_id\": \"Netflix promotional skit\", \"causal_link_to_next\": \"The promotional segment concludes with the announcement of Season 2, leading directly to the title card for 'India's Got Latent Season 2'.\"}, {\"summary\": \"A title card reading 'India's Got Latent Season 2' appears on a black background with golden text and a stylized graphic of a hand holding a microphone with lightning bolts.\", \"end_time\": 129.0, \"start_time\": 127.44, \"participants\": [], \"emotional_arc\": \"Neutral, informational.\", \"canonical_scene_id\": \"Title card for India's Got Latent Season 2\", \"causal_link_to_next\": \"The title card signals the upcoming season, transitioning to a 'COMING SOON' graphic.\"}, {\"summary\": \"A 'COMING SOON' text appears against a dramatic red and blue curtain backdrop, signaling an upcoming release.\", \"end_time\": 130.08, \"start_time\": 129.0, \"participants\": [], \"emotional_arc\": \"Neutral, anticipatory.\", \"canonical_scene_id\": \"COMING SOON graphic with curtain backdrop\", \"causal_link_to_next\": \"Leads to another 'COMING SOON' graphic with an abstract background.\"}, {\"summary\": \"A vibrant, abstract background with vertical color streaks displays the text 'COMING SOON', signaling an upcoming release or event.\", \"end_time\": 130.92000000000002, \"start_time\": 130.08, \"participants\": [], \"emotional_arc\": \"Neutral, anticipatory.\", \"canonical_scene_id\": \"COMING SOON graphic with abstract background\", \"causal_link_to_next\": null}, {\"summary\": \"A stylized 'COMING SOON' title card appears against colorful vertical streaks, signaling upcoming content.\", \"end_time\": 131.28, \"start_time\": 130.92000000000002, \"participants\": [], \"emotional_arc\": \"Neutral, anticipatory\", \"canonical_scene_id\": \"Coming Soon Title\", \"causal_link_to_next\": \"Leads into the Netflix platform branding.\"}, {\"summary\": \"The Netflix logo animates with red and blue light streaks against a black background, establishing the video's platform.\", \"end_time\": 131.64, \"start_time\": 131.28, \"participants\": [], \"emotional_arc\": \"Neutral, brand-establishing\", \"canonical_scene_id\": \"Netflix Logo Intro (Part 1)\", \"causal_link_to_next\": \"Continues into further logo animation.\"}, {\"summary\": \"The Netflix logo continues animating with red light streaks, reinforcing the brand identity.\", \"end_time\": 132.12, \"start_time\": 131.64, \"participants\": [], \"emotional_arc\": \"Neutral, continuation\", \"canonical_scene_id\": \"Netflix Logo Intro (Part 2)\", \"causal_link_to_next\": \"Leads to final part of logo sequence.\"}, {\"summary\": \"The Netflix logo appears centered with vertical red and purple light streaks, completing the platform introduction.\", \"end_time\": 132.95999999999998, \"start_time\": 132.12, \"participants\": [], \"emotional_arc\": \"Neutral, concluding the brand intro\", \"canonical_scene_id\": \"Netflix Logo Intro (Part 3)\", \"causal_link_to_next\": null}, {\"summary\": \"The Netflix logo appears centered on a black background with blue and red vertical light streaks, establishing the platform branding.\", \"end_time\": 133.8, \"start_time\": 132.95999999999998, \"participants\": [], \"emotional_arc\": \"Neutral mood with low tension throughout.\", \"canonical_scene_id\": \"Netflix Logo Animation\", \"causal_link_to_next\": \"The platform introduction sets up the transition to further visual effects.\"}, {\"summary\": \"The Netflix logo remains on screen with vertical blue and red light streaks, reinforcing the platform identity.\", \"end_time\": 134.39999999999998, \"start_time\": 133.8, \"participants\": [], \"emotional_arc\": \"Maintains neutral mood and low tension.\", \"canonical_scene_id\": \"Netflix Logo Continuation\", \"causal_link_to_next\": \"The continued branding leads into a more dramatic visual transition.\"}, {\"summary\": \"A vertical red light streaks against a black void accompanied by rhythmic tapping sounds, suggesting a symbolic rupture or transition.\", \"end_time\": 134.76, \"start_time\": 134.39999999999998, \"participants\": [], \"emotional_arc\": \"Shifts from neutral to ominous with high tension.\", \"canonical_scene_id\": \"Red Light Streak Transition\", \"causal_link_to_next\": \"The ominous transition introduces a theatrical curtain opening.\"}, {\"summary\": \"A dramatic red curtain parts in darkness with rhythmic thumping sounds, signaling the opening of a performance or pivotal moment.\", \"end_time\": 136.56, \"start_time\": 134.76, \"participants\": [], \"emotional_arc\": \"Ominous mood with medium tension, establishing anticipation.\", \"canonical_scene_id\": \"Red Curtain Opening\", \"causal_link_to_next\": null}, {\"summary\": \"A Netflix subscription prompt appears on a red gradient background with a rhythmic sound effect, likely marking a transition point in the video.\", \"end_time\": 139.8, \"start_time\": 136.56, \"participants\": [], \"emotional_arc\": \"Neutral, low-tension promotional interlude.\", \"canonical_scene_id\": \"Netflix subscription prompt screen\", \"causal_link_to_next\": \"Leads to a similar subscription prompt screen.\"}, {\"summary\": \"A static Netflix subscription prompt appears, signaling the conclusion of the video content.\", \"end_time\": 143.16000000000003, \"start_time\": 139.8, \"participants\": [], \"emotional_arc\": \"Neutral, low-tension end card.\", \"canonical_scene_id\": \"Netflix subscription prompt screen__at_139.8s\", \"causal_link_to_next\": \"Leads to the final subscription prompt resolution screen.\"}, {\"summary\": \"A static Netflix subscription prompt appears as the video's final end card, prompting viewer subscription.\", \"end_time\": 145.08, \"start_time\": 143.16000000000003, \"participants\": [], \"emotional_arc\": \"Neutral resolution with no remaining tension.\", \"canonical_scene_id\": \"Netflix subscription prompt screen__at_143.2s\", \"causal_link_to_next\": null}]",
+      "created_at": "2026-07-29T16:14:16.148760+00:00",
+      "has_embedding": true
+    }
+  ],
+  "scenes": [
+    {
+      "id": "88da5763-8a3e-49a4-9428-ea65828a5d28",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix promotional skit",
+      "discarded_aliases": [
+        "scene_000",
+        "netflix_office_announcement",
+        "netflix_office_celebration",
+        "netflix_office_interior",
+        "netflix_promo_scene"
+      ],
+      "start_time": 0.0,
+      "end_time": 127.44,
+      "participants": [
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "summary": "The video opens with a black screen, then shows a person writing 'Season 2 coming soon' on a cartoon heart cutout in a Netflix office as others react joyfully. The cast engages in discussions about Netflix's value, lack of comment sections, and unfiltered content, interspersed with cooking show segments and promotional gestures with lemons and chilies. The scene culminates with a man on stage before red curtains announcing 'India's God Late' Season 2 and a future special, followed by the cast holding firecrackers amidst confetti.",
+      "emotional_arc": "Playful celebration shifts to confrontational debate about Netflix's features, then returns to lighthearted promotion and culminates in celebratory anticipation.",
+      "causal_link_to_next": "The promotional segment concludes with the announcement of Season 2, leading directly to the title card for 'India's Got Latent Season 2'.",
+      "usability_score": 0.7884063142912405,
+      "has_embedding": true
+    },
+    {
+      "id": "fb2c6d87-dc72-4038-8d9d-b6010fdf59fd",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "netflix_office_promo",
+      "discarded_aliases": [
+        "black_screen",
+        "man_red_plaid_write_heart",
+        "four_men_studio_set",
+        "three_men_office_conversation",
+        "man_red_black_plaid_gestures",
+        "group_promo_moment",
+        "theater_stage_red_curtain",
+        "man_with_lemon_and_greens",
+        "man_with_green_chilies",
+        "man_holding_decorative_plant"
+      ],
+      "start_time": 0.0,
+      "end_time": 126.24,
+      "participants": [
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "summary": "The scene opens with a black screen before transitioning to a Netflix office where P2 (in red plaid) leads a promotional discussion about Season 2 of 'India's God Late', using props like lemons, chilies, and plants. The tone is playful yet confrontational, with P2 mediating tensions between P1 and P3 over content control and platform decisions. Multiple frames show staged interactions centered on authenticity, unfiltered content, and Netflix's business model, culminating in P2 directly addressing the camera to promote upcoming content.",
+      "emotional_arc": "Starts neutral, shifts to playful-confrontational as team dynamics surface, then resolves in promotional enthusiasm.",
+      "causal_link_to_next": "Promotional energy and mention of 'Season 2' directly set up the title card reveal in the next scene.",
+      "usability_score": 0.7878438466069637,
+      "has_embedding": true
+    },
+    {
+      "id": "e9f077dd-5193-449c-8d17-69e52ab539c1",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_1_netflix_office",
+      "discarded_aliases": [
+        "scene_2_studio_set",
+        "scene_3_studio_set",
+        "scene_4_office",
+        "scene_5_office",
+        "scene_6_living_room",
+        "scene_7_living_room",
+        "scene_8_living_room",
+        "scene_9_modern_living_room",
+        "scene_10_living_room",
+        "scene_11_office_lounge",
+        "scene_12_studio_cooking_theme",
+        "scene_13_theater_stage"
+      ],
+      "start_time": 0.0,
+      "end_time": 126.24,
+      "participants": [
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "summary": "In a Netflix office and studio setting, P1, P2, and others react to news about 'Ladina Season 2' being released on Netflix and YouTube, with P1 and P2 engaging in a heated discussion over platform value, financial motives, and fan engagement, while P3 plays comic relief and P4 mediates or observes. Tensions rise over content ownership and the ethics of monetization, culminating in a confrontation where P2 demands P3 stop traveling to Peshawar and focus on generating income through fans instead.",
+      "emotional_arc": "Begins with playful announcement, shifts to confrontation over platform and financial ethics, peaks in tension with ultimatums, then briefly resolves into promotional camaraderie.",
+      "causal_link_to_next": "The conflict over platform loyalty and content monetization leads directly into the formal announcement of 'India's Got Latent Season 2', positioning the behind-the-scenes drama as part of the show's narrative appeal.",
+      "usability_score": 0.7878438466069637,
+      "has_embedding": true
+    },
+    {
+      "id": "c4a0e67a-d702-47e4-bc2c-8d44044ec737",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_1",
+      "discarded_aliases": [
+        "scene_000",
+        "netflix_office_announcement",
+        "netflix_office_celebration",
+        "netflix_office_interior",
+        "netflix_promo_scene"
+      ],
+      "start_time": 0.0,
+      "end_time": 126.24,
+      "participants": [
+        "P1",
+        "P2",
+        "P3",
+        "P4"
+      ],
+      "summary": "The video opens with a black screen before transitioning to a Netflix office setting where characters celebrate the announcement of 'India's God Late' Season 2. P2 writes on a cartoon heart mural while others react with joy, establishing a playful tone. Multiple frames show P1, P2, and P3 in various configurations—tense discussions, lighthearted exchanges, and confrontations—centered around themes of platform value, content authenticity, and financial motives, all set against backdrops featuring Netflix branding.",
+      "emotional_arc": "neutral to playful to confrontational",
+      "causal_link_to_next": "The promotional energy and interpersonal tension set up the formal introduction of the show in the next scene.",
+      "usability_score": 0.7878438466069637,
+      "has_embedding": true
+    },
+    {
+      "id": "37d67f20-b897-44b1-9520-d12888bb1be3",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "office_promo_and_confrontation",
+      "discarded_aliases": [
+        "Netflix office celebration",
+        "studio set with cartoon mural",
+        "tense negotiation about Netflix",
+        "lighthearted promotional moment",
+        "man with red plaid shirt writing",
+        "black screen intro"
+      ],
+      "start_time": 0.0,
+      "end_time": 127.44,
+      "participants": [],
+      "summary": "The video opens in a Netflix office setting where cast members, led by P2 in a red plaid shirt, celebrate Season 2 of 'India's God Late' through lighthearted antics and staged confrontations. Tension fluctuates as characters debate financial stakes, platform loyalty (notably Netflix's lack of comment sections), and creative control — escalating into heated exchanges that later pivot back to playful promotion, using props like lemons, chilies, and firecrackers for comedic effect.",
+      "emotional_arc": "Shifts from playful promotion to confrontational tension over financial and platform-related conflicts, then resolves into lighthearted camaraderie.",
+      "causal_link_to_next": "The celebratory and promotional energy peaks with the announcement of Season 2, leading directly into the formal title reveal of 'India's Got Latent Season 2'.",
+      "usability_score": 0.7884063142912405,
+      "has_embedding": true
+    },
+    {
+      "id": "445c56cb-fd2e-4881-ac5b-3235a1422b22",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Title card for India's Got Latent Season 2",
+      "discarded_aliases": [],
+      "start_time": 127.44,
+      "end_time": 129.0,
+      "participants": [],
+      "summary": "A title card reading 'India's Got Latent Season 2' appears on a black background with golden text and a stylized graphic of a hand holding a microphone with lightning bolts.",
+      "emotional_arc": "Neutral, informational.",
+      "causal_link_to_next": "The title card signals the upcoming season, transitioning to a 'COMING SOON' graphic.",
+      "usability_score": 0.48501875,
+      "has_embedding": true
+    },
+    {
+      "id": "ab66ef7c-651c-497a-9a7e-f7fb64b61057",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "title_card_season_2",
+      "discarded_aliases": [
+        "golden text intro",
+        "lightning mic graphic",
+        "hand with microphone"
+      ],
+      "start_time": 127.44,
+      "end_time": 129.0,
+      "participants": [],
+      "summary": "A stylized title card reveals 'India's Got Latent Season 2' on a black background with golden text and a graphic of a hand holding a microphone emitting lightning bolts, signaling the official branding of the upcoming season.",
+      "emotional_arc": "Anticipatory and dramatic, designed to build excitement for the new season.",
+      "causal_link_to_next": "This formal reveal transitions into the 'COMING SOON' promotion as a direct follow-up to the title, heightening audience expectation.",
+      "usability_score": 0.48501875,
+      "has_embedding": true
+    },
+    {
+      "id": "dacab911-2af3-4c5d-b2bf-3e79f1df4fcb",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_2_title_card",
+      "discarded_aliases": [],
+      "start_time": 128.64,
+      "end_time": 128.64,
+      "participants": [],
+      "summary": "The title card for 'India's Got Latent Season 2' appears on a black background with golden text and a stylized graphic of a hand holding a microphone with lightning bolts, formally announcing the show’s return.",
+      "emotional_arc": "Formal and anticipatory, marking a shift from chaotic interpersonal conflict to structured programming announcement.",
+      "causal_link_to_next": "This title card sets up the upcoming release of the show, leading directly into the 'COMING SOON' teasers.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "0c84bfde-2574-47a4-afd1-b8ba48bac0ba",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_2",
+      "discarded_aliases": [],
+      "start_time": 128.64,
+      "end_time": 128.64,
+      "participants": [],
+      "summary": "A title card appears on a black background with golden text reading 'India's Got Latent Season 2', accompanied by a stylized graphic of a hand holding a microphone with lightning bolts, formally introducing the show.",
+      "emotional_arc": "neutral and anticipatory",
+      "causal_link_to_next": "This title card directly leads into the 'Coming Soon' announcement in the next scene.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "f230b8fe-1ab1-48f6-9152-af99f3aca9ac",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "coming_soon_curtain",
+      "discarded_aliases": [
+        "dramatic curtain backdrop",
+        "red and blue reveal",
+        "release announcement"
+      ],
+      "start_time": 129.0,
+      "end_time": 130.08,
+      "participants": [],
+      "summary": "Bold 'COMING SOON' text appears against a dramatic red and blue curtain backdrop, reinforcing the imminent release of the show.",
+      "emotional_arc": "Suspenseful yet celebratory, maintaining momentum after the title reveal.",
+      "causal_link_to_next": "The 'COMING SOON' motif is echoed in the next scene with an abstract color-streaked version, creating visual continuity.",
+      "usability_score": 0.38,
+      "has_embedding": true
+    },
+    {
+      "id": "3bd3c08a-5181-4dd8-a1dd-ef175d8fd286",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "COMING SOON graphic with curtain backdrop",
+      "discarded_aliases": [],
+      "start_time": 129.0,
+      "end_time": 130.08,
+      "participants": [],
+      "summary": "A 'COMING SOON' text appears against a dramatic red and blue curtain backdrop, signaling an upcoming release.",
+      "emotional_arc": "Neutral, anticipatory.",
+      "causal_link_to_next": "Leads to another 'COMING SOON' graphic with an abstract background.",
+      "usability_score": 0.38,
+      "has_embedding": true
+    },
+    {
+      "id": "5b53fb33-f4da-45c6-a732-680326c5d8ae",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_3",
+      "discarded_aliases": [],
+      "start_time": 129.36,
+      "end_time": 129.36,
+      "participants": [],
+      "summary": "A bold 'COMING SOON' text appears against a dramatic red and blue curtain backdrop, reinforcing the anticipation for the upcoming release.",
+      "emotional_arc": "building anticipation",
+      "causal_link_to_next": "The 'COMING SOON' message transitions into a more abstract version of the same announcement.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "5bd0be68-1a42-4ecc-9e48-b0ec0fb0d681",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_3_coming_soon_red_blue_curtain",
+      "discarded_aliases": [
+        "scene_4_coming_soon_abstract_background"
+      ],
+      "start_time": 129.36,
+      "end_time": 129.36,
+      "participants": [],
+      "summary": "A bold 'COMING SOON' text appears against a dramatic red and blue curtain backdrop, followed by a second version with vertical color streaks, signaling the imminent release of new content.",
+      "emotional_arc": "Builds momentum and audience anticipation after the title reveal.",
+      "causal_link_to_next": "These 'COMING SOON' cards serve as final teases before the full promotional campaign, implying the narrative conflict has been packaged into an upcoming season.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "56db82e0-7391-4984-9158-c2885e253717",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "COMING SOON graphic with abstract background",
+      "discarded_aliases": [],
+      "start_time": 130.08,
+      "end_time": 130.92000000000002,
+      "participants": [],
+      "summary": "A vibrant, abstract background with vertical color streaks displays the text 'COMING SOON', signaling an upcoming release or event.",
+      "emotional_arc": "Neutral, anticipatory.",
+      "causal_link_to_next": null,
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "5d9ee76d-d025-4c0c-a319-b5345a526110",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "coming_soon_abstract",
+      "discarded_aliases": [
+        "color streak background",
+        "vibrant abstract transition",
+        "upcoming event announcement"
+      ],
+      "start_time": 130.08,
+      "end_time": 130.92000000000002,
+      "participants": [],
+      "summary": "Another 'COMING SOON' card appears, this time over a vibrant abstract background with vertical color streaks, repeating the anticipation motif with altered visuals.",
+      "emotional_arc": "Continuation of suspense and promotion, visually evolving but thematically consistent.",
+      "causal_link_to_next": "Closes the promotional loop, implying the next logical step is either a teaser or return to character-driven scenes — but no direct narrative escalation is evident within this batch.",
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "c3c4a30b-638d-4d29-b023-92ecacd6d772",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "scene_4",
+      "discarded_aliases": [],
+      "start_time": 130.8,
+      "end_time": 130.8,
+      "participants": [],
+      "summary": "Another 'COMING SOON' text appears, now over a vibrant, abstract background with vertical color streaks, maintaining the promotional tone and visual momentum.",
+      "emotional_arc": "sustained anticipation",
+      "causal_link_to_next": null,
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "d1c413b6-7bec-4bf4-a448-bf3db4eddcfa",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Coming Soon Title",
+      "discarded_aliases": [],
+      "start_time": 130.92000000000002,
+      "end_time": 131.28,
+      "participants": [],
+      "summary": "A stylized 'COMING SOON' title card appears against colorful vertical streaks, signaling upcoming content.",
+      "emotional_arc": "Neutral, anticipatory",
+      "causal_link_to_next": "Leads into the Netflix platform branding.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "46f7f57e-fd65-4099-9aa3-9a8d362d794d",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "COMING_SOON_transition",
+      "discarded_aliases": [],
+      "start_time": 130.92000000000002,
+      "end_time": 131.28,
+      "participants": [],
+      "summary": "A 'COMING SOON' text appears against dynamic vertical color streaks, signaling an upcoming release and building audience anticipation.",
+      "emotional_arc": "neutral to anticipatory",
+      "causal_link_to_next": "Sets up the next scene by transitioning into the Netflix-branded content that follows.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "22db153a-9fb0-48be-bb2b-6c6a48a28978",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "ComingSoon_DynamicStreaks",
+      "discarded_aliases": [],
+      "start_time": 131.04,
+      "end_time": 131.04,
+      "participants": [],
+      "summary": "A 'COMING SOON' text is displayed over a background of vertical color streaks, signaling an upcoming release and building audience anticipation.",
+      "emotional_arc": "anticipation, neutrality",
+      "causal_link_to_next": "Transitions into branding content by leading directly into the Netflix logo animation, maintaining a promotional tone.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "e3d3190c-4bae-4c9b-9d81-183cc797b6cc",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "COMING_SOON_Release_Animation",
+      "discarded_aliases": [],
+      "start_time": 131.04,
+      "end_time": 131.04,
+      "participants": [],
+      "summary": "A 'COMING SOON' text is displayed with dynamic vertical color streaks, signaling the upcoming release of content.",
+      "emotional_arc": "anticipatory",
+      "causal_link_to_next": "Signals the beginning of promotional content, leading into the Netflix brand reveal.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "b3f65c97-5863-463e-b2b7-180059957b58",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix Logo Intro (Part 1)",
+      "discarded_aliases": [],
+      "start_time": 131.28,
+      "end_time": 131.64,
+      "participants": [],
+      "summary": "The Netflix logo animates with red and blue light streaks against a black background, establishing the video's platform.",
+      "emotional_arc": "Neutral, brand-establishing",
+      "causal_link_to_next": "Continues into further logo animation.",
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "26f15228-6204-47d4-af29-6703d862e5f0",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix_logo_animation_red_blue",
+      "discarded_aliases": [
+        "Netflix_logo_animation_red",
+        "Netflix_logo_appears_red_purple"
+      ],
+      "start_time": 131.52,
+      "end_time": 131.52,
+      "participants": [],
+      "summary": "The Netflix logo animates with red and blue light streaks against a black background, establishing brand identity at the video's start.",
+      "emotional_arc": "neutral, branding-focused",
+      "causal_link_to_next": "Introduces the platform's visual identity, setting the stage for the show announcement; this is the primary opening variant used across frames.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "81c92bf0-1c94-4f8f-a62c-e0dec2d636fb",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix Logo Intro (Part 2)",
+      "discarded_aliases": [],
+      "start_time": 131.64,
+      "end_time": 132.12,
+      "participants": [],
+      "summary": "The Netflix logo continues animating with red light streaks, reinforcing the brand identity.",
+      "emotional_arc": "Neutral, continuation",
+      "causal_link_to_next": "Leads to final part of logo sequence.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "3632c3b8-84ee-41f5-8602-8b973a6b9d04",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix_logo_animation_red",
+      "discarded_aliases": [],
+      "start_time": 131.76,
+      "end_time": 131.76,
+      "participants": [],
+      "summary": "The Netflix logo animates with red light streaks against a black background, functioning as a minor visual variant of the brand intro.",
+      "emotional_arc": "neutral",
+      "causal_link_to_next": "Reinforces brand presence but is visually superseded by the red-blue variant; likely an alternate render.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "04ff299d-5d7e-47de-a702-133c043fb0c7",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix Logo Intro (Part 3)",
+      "discarded_aliases": [],
+      "start_time": 132.12,
+      "end_time": 132.95999999999998,
+      "participants": [],
+      "summary": "The Netflix logo appears centered with vertical red and purple light streaks, completing the platform introduction.",
+      "emotional_arc": "Neutral, concluding the brand intro",
+      "causal_link_to_next": null,
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "23d79d1e-3834-4d55-ab1f-99a27d46e081",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix_logo_animation",
+      "discarded_aliases": [
+        "Netflix_logo_with_red_and_purple_streaks"
+      ],
+      "start_time": 132.12,
+      "end_time": 132.95999999999998,
+      "participants": [],
+      "summary": "The Netflix logo is shown again with vertical red and purple light streaks on a black background, continuing the sequence of branded intros.",
+      "emotional_arc": "neutral, concluding setup",
+      "causal_link_to_next": "Finalizes the opening branding suite, likely leading into the main promotional content for 'India's Got Latent Season 2'.",
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "d3da0e06-4a13-47f4-8d7c-516f88802498",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "NetflixLogo_Animated",
+      "discarded_aliases": [
+        "NetflixLogo_RedPurpleStreaks_BlackBG"
+      ],
+      "start_time": 132.48,
+      "end_time": 132.48,
+      "participants": [],
+      "summary": "The Netflix logo is shown centered with vertical red and purple light streaks on a black background, completing the brand establishment sequence.",
+      "emotional_arc": "neutrality, closure of branding segment",
+      "causal_link_to_next": "Finalizes the branding sequence, setting the stage for the title card or main content to follow.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "1036a3e6-0b22-4c67-b91b-8dbad3b78d57",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix_logo_appears_red_purple",
+      "discarded_aliases": [],
+      "start_time": 132.48,
+      "end_time": 132.48,
+      "participants": [],
+      "summary": "The Netflix logo appears centered with vertical red and purple light streaks on black, serving as another color variation of the brand intro.",
+      "emotional_arc": "neutral",
+      "causal_link_to_next": "Alternate branding motif; does not progress narrative but contributes to stylistic continuity.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "f57b806a-078c-411f-832c-e565a6f5c72a",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix_Opening_Animation",
+      "discarded_aliases": [],
+      "start_time": 132.48,
+      "end_time": 132.48,
+      "participants": [],
+      "summary": "The Netflix logo remains on screen with animated light streaks, solidifying the brand's identity as the content provider.",
+      "emotional_arc": "neutral",
+      "causal_link_to_next": null,
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "5e1ecd63-a8c3-4035-8b3a-23c23fac632f",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix Logo Animation",
+      "discarded_aliases": [],
+      "start_time": 132.95999999999998,
+      "end_time": 133.8,
+      "participants": [],
+      "summary": "The Netflix logo appears centered on a black background with blue and red vertical light streaks, establishing the platform branding.",
+      "emotional_arc": "Neutral mood with low tension throughout.",
+      "causal_link_to_next": "The platform introduction sets up the transition to further visual effects.",
+      "usability_score": 0.53,
+      "has_embedding": true
+    },
+    {
+      "id": "c467f0af-d439-402b-a343-3c3c634b07a2",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix Logo Continuation",
+      "discarded_aliases": [],
+      "start_time": 133.8,
+      "end_time": 134.39999999999998,
+      "participants": [],
+      "summary": "The Netflix logo remains on screen with vertical blue and red light streaks, reinforcing the platform identity.",
+      "emotional_arc": "Maintains neutral mood and low tension.",
+      "causal_link_to_next": "The continued branding leads into a more dramatic visual transition.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "4168bac9-7db6-4649-8c02-877dcd95efa8",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "netflix_logo_black_background",
+      "discarded_aliases": [],
+      "start_time": 133.8,
+      "end_time": 134.39999999999998,
+      "participants": [],
+      "summary": "The Netflix logo reappears with identical visual styling—centered on black with vertical blue and red streaks—reinforcing brand presence at video onset.",
+      "emotional_arc": "neutral and repetitive",
+      "causal_link_to_next": "Reiteration of branding maintains audience orientation before transitioning to symbolic imagery.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "974aaba8-1668-463d-9680-a8e47bd98b78",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "netflix_logo_blue_red_streaks",
+      "discarded_aliases": [],
+      "start_time": 134.16,
+      "end_time": 134.16,
+      "participants": [],
+      "summary": "Repeated appearance of the Netflix logo with identical blue and red light streaks reinforces brand recognition at the start of the video.",
+      "emotional_arc": "Consistently neutral, maintaining a steady platform-introductory tone.",
+      "causal_link_to_next": "The repetition confirms the initiation of branded content, leading into a shift in mood with more dynamic visuals.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "e2fef525-6c28-4e28-abc0-5c486f83493a",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Red Light Streak Transition",
+      "discarded_aliases": [],
+      "start_time": 134.39999999999998,
+      "end_time": 134.76,
+      "participants": [],
+      "summary": "A vertical red light streaks against a black void accompanied by rhythmic tapping sounds, suggesting a symbolic rupture or transition.",
+      "emotional_arc": "Shifts from neutral to ominous with high tension.",
+      "causal_link_to_next": "The ominous transition introduces a theatrical curtain opening.",
+      "usability_score": 0.51790625,
+      "has_embedding": true
+    },
+    {
+      "id": "e89315db-266a-48b7-9570-e14346b12f9c",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "red_light_streak_transition",
+      "discarded_aliases": [],
+      "start_time": 134.39999999999998,
+      "end_time": 134.76,
+      "participants": [],
+      "summary": "A vertical red light streaks across a black void, paired with rhythmic tapping sounds, creating a sense of suspenseful transition or rupture.",
+      "emotional_arc": "rising tension and ominous anticipation",
+      "causal_link_to_next": "Signals a narrative shift, moving from static branding to dynamic, symbolic motion that sets up theatrical reveal.",
+      "usability_score": 0.51790625,
+      "has_embedding": true
+    },
+    {
+      "id": "c7b21be5-6fda-422d-aeb0-b7eed1241f0e",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "red_light_streak_black_void_transition",
+      "discarded_aliases": [
+        "vertical_red_light_streaks_against_black_void_suggesting_transition_symbolic_rupture"
+      ],
+      "start_time": 134.64,
+      "end_time": 134.64,
+      "participants": [],
+      "summary": "A vertical red light streaks across a black void, accompanied by rapid rhythmic tapping, suggesting a narrative transition or symbolic rupture.",
+      "emotional_arc": "Shifts from neutral to ominous, increasing tension and signaling a departure from static branding.",
+      "causal_link_to_next": "The rising tension and use of red as a recurring motif directly lead into the theatrical reveal of a parting red curtain.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "5ed2ee7c-e439-49a6-8cf6-ee2d9f69c0bd",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Red Curtain Opening",
+      "discarded_aliases": [],
+      "start_time": 134.76,
+      "end_time": 136.56,
+      "participants": [],
+      "summary": "A dramatic red curtain parts in darkness with rhythmic thumping sounds, signaling the opening of a performance or pivotal moment.",
+      "emotional_arc": "Ominous mood with medium tension, establishing anticipation.",
+      "causal_link_to_next": null,
+      "usability_score": 0.4663239912553267,
+      "has_embedding": true
+    },
+    {
+      "id": "a16233c4-0f26-4c32-8839-0e184c54eb72",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "red_curtain_parting",
+      "discarded_aliases": [],
+      "start_time": 134.76,
+      "end_time": 136.56,
+      "participants": [],
+      "summary": "A dramatic red curtain parts in darkness, accompanied by rhythmic thumping, evoking a theatrical opening or imminent revelation.",
+      "emotional_arc": "dramatic and suspenseful",
+      "causal_link_to_next": "Completes the transition from branding to narrative performance mode, suggesting the main content is about to begin.",
+      "usability_score": 0.4663239912553267,
+      "has_embedding": true
+    },
+    {
+      "id": "59f27b5f-074a-43e1-905e-364d3c964ffa",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "red_curtain_parting_darkness",
+      "discarded_aliases": [
+        "dramatic_red_curtain_parting_darkness_accompanied_rhythmic_thumping_sound_signals_opening_performance_pivotal_moment"
+      ],
+      "start_time": 134.88,
+      "end_time": 134.88,
+      "participants": [],
+      "summary": "A red curtain dramatically parts in darkness, underscored by rhythmic thumping, evoking a theatrical opening or revelation.",
+      "emotional_arc": "Ominous and anticipatory, marking the transition from branding to performance-oriented narrative.",
+      "causal_link_to_next": "The curtain reveal establishes a stage-like context, suggesting that the main content—possibly a competition or conflict—will now begin.",
+      "usability_score": 0.5,
+      "has_embedding": true
+    },
+    {
+      "id": "f146c49b-7e74-4e0c-9d36-a05e42b9434e",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix subscription prompt screen",
+      "discarded_aliases": [],
+      "start_time": 136.56,
+      "end_time": 139.8,
+      "participants": [],
+      "summary": "A Netflix subscription prompt appears on a red gradient background with a rhythmic sound effect, likely marking a transition point in the video.",
+      "emotional_arc": "Neutral, low-tension promotional interlude.",
+      "causal_link_to_next": "Leads to a similar subscription prompt screen.",
+      "usability_score": 0.6152102106267756,
+      "has_embedding": true
+    },
+    {
+      "id": "0f950dfa-736d-400d-b5a2-4cb01a81fc5d",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix subscription prompt screen__at_139.8s",
+      "discarded_aliases": [],
+      "start_time": 139.8,
+      "end_time": 143.16000000000003,
+      "participants": [],
+      "summary": "A static Netflix subscription prompt appears, signaling the conclusion of the video content.",
+      "emotional_arc": "Neutral, low-tension end card.",
+      "causal_link_to_next": "Leads to the final subscription prompt resolution screen.",
+      "usability_score": 0.7258345170454545,
+      "has_embedding": true
+    },
+    {
+      "id": "22c1ad9e-d406-4403-85d9-22851acd4191",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "Netflix subscription prompt screen__at_143.2s",
+      "discarded_aliases": [],
+      "start_time": 143.16000000000003,
+      "end_time": 145.08,
+      "participants": [],
+      "summary": "A static Netflix subscription prompt appears as the video's final end card, prompting viewer subscription.",
+      "emotional_arc": "Neutral resolution with no remaining tension.",
+      "causal_link_to_next": null,
+      "usability_score": 0.6979285037878789,
+      "has_embedding": true
+    },
+    {
+      "id": "88900107-6c28-4020-bca7-0cd6f8e94dfa",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "canonical_scene_id": "netflix_subscription_prompt",
+      "discarded_aliases": [],
+      "start_time": 143.16000000000003,
+      "end_time": 145.08,
+      "participants": [],
+      "summary": "Final frame displays the same Netflix subscription prompt on red gradient, definitively marking the video's end.",
+      "emotional_arc": "finality",
+      "causal_link_to_next": null,
+      "usability_score": 0.6979285037878789,
+      "has_embedding": true
+    }
+  ],
+  "speaker_turns": [],
+  "relation_canonicalization": {
+    "summary_by_canonical_relation": [
+      {
+        "canonical_relation": "ILLUSTRATES_THEME",
+        "n": 956
+      },
+      {
+        "canonical_relation": "APPEARS_IN",
+        "n": 320
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "n": 274
+      },
+      {
+        "canonical_relation": "CONTAINS_OBJECT",
+        "n": 256
+      },
+      {
+        "canonical_relation": "OTHER",
+        "n": 223
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "n": 220
+      },
+      {
+        "canonical_relation": "IN_LOCATION",
+        "n": 105
+      },
+      {
+        "canonical_relation": "PART_OF_SCENE",
+        "n": 104
+      },
+      {
+        "canonical_relation": "ADDRESSES",
+        "n": 61
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "n": 47
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "n": 26
+      },
+      {
+        "canonical_relation": "SPEAKS_TO",
+        "n": 18
+      },
+      {
+        "canonical_relation": "REACTS_TO",
+        "n": 17
+      },
+      {
+        "canonical_relation": "CRITICIZES",
+        "n": 17
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "n": 15
+      },
+      {
+        "canonical_relation": "FOLLOWS",
+        "n": 11
+      },
+      {
+        "canonical_relation": "EXPLAINS",
+        "n": 7
+      },
+      {
+        "canonical_relation": "ASKS",
+        "n": 3
+      },
+      {
+        "canonical_relation": "DISAGREES_WITH",
+        "n": 2
+      },
+      {
+        "canonical_relation": "IS_SEATED_NEAR",
+        "n": 1
+      }
+    ],
+    "raw_relation_to_canonical_mapping": [
+      {
+        "canonical_relation": "ILLUSTRATES_THEME",
+        "relation": "THEME_PRESENT",
+        "n": 478
+      },
+      {
+        "canonical_relation": "ILLUSTRATES_THEME",
+        "relation": "ILLUSTRATES_THEME",
+        "n": 478
+      },
+      {
+        "canonical_relation": "CONTAINS_OBJECT",
+        "relation": "CONTAINS_OBJECT",
+        "n": 256
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "CO_OCCURS_WITH",
+        "n": 211
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "EXPRESSES",
+        "n": 159
+      },
+      {
+        "canonical_relation": "APPEARS_IN",
+        "relation": "APPEARS_IN",
+        "n": 158
+      },
+      {
+        "canonical_relation": "APPEARS_IN",
+        "relation": "PRESENT_IN_SCENE",
+        "n": 158
+      },
+      {
+        "canonical_relation": "IN_LOCATION",
+        "relation": "IN_LOCATION",
+        "n": 104
+      },
+      {
+        "canonical_relation": "PART_OF_SCENE",
+        "relation": "PART_OF_SCENE",
+        "n": 104
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "HAS_MOOD",
+        "n": 104
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "DRIVES_SCENE",
+        "n": 72
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "SPEAKS_IN",
+        "n": 71
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "INTRODUCED_IN",
+        "n": 64
+      },
+      {
+        "canonical_relation": "ADDRESSES",
+        "relation": "ADDRESSES",
+        "n": 53
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "relation": "OBSERVES",
+        "n": 26
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "relation": "IS_OBSERVING",
+        "n": 14
+      },
+      {
+        "canonical_relation": "SPEAKS_TO",
+        "relation": "IS_SPEAKING_TO",
+        "n": 13
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "relation": "IS_HOLDING",
+        "n": 12
+      },
+      {
+        "canonical_relation": "FOLLOWS",
+        "relation": "FOLLOWS",
+        "n": 11
+      },
+      {
+        "canonical_relation": "REACTS_TO",
+        "relation": "IS_LISTENING_TO",
+        "n": 10
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "relation": "HELD_BY",
+        "n": 9
+      },
+      {
+        "canonical_relation": "CRITICIZES",
+        "relation": "CONFRONTS",
+        "n": 9
+      },
+      {
+        "canonical_relation": "ADDRESSES",
+        "relation": "IS_ADDRESSING",
+        "n": 8
+      },
+      {
+        "canonical_relation": "CRITICIZES",
+        "relation": "IS_CONFRONTING",
+        "n": 7
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "IS_GESTURING_TOWARD",
+        "n": 7
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "IS_SMILING_AT",
+        "n": 6
+      },
+      {
+        "canonical_relation": "SPEAKS_TO",
+        "relation": "SPEAKS_TO",
+        "n": 5
+      },
+      {
+        "canonical_relation": "REACTS_TO",
+        "relation": "IS_REACTING_TO",
+        "n": 5
+      },
+      {
+        "canonical_relation": "EXPLAINS",
+        "relation": "IS_EXPLAINING_TO",
+        "n": 5
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "IS_STANDING_NEXT_TO",
+        "n": 4
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "relation": "IS_LOOKING_AT",
+        "n": 4
+      },
+      {
+        "canonical_relation": "APPEARS_IN",
+        "relation": "FIRST_SEEN_IN",
+        "n": 4
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_RESISTING",
+        "n": 3
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "COLLABORATES",
+        "n": 3
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "IS_GESTURING_WHILE_SPEAKING_TO",
+        "n": 3
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_MEDIATING_BETWEEN",
+        "n": 2
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "relation": "FACES",
+        "n": 2
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "relation": "HOLDS",
+        "n": 2
+      },
+      {
+        "canonical_relation": "DISAGREES_WITH",
+        "relation": "IS_ARGUING_WITH",
+        "n": 2
+      },
+      {
+        "canonical_relation": "EXPLAINS",
+        "relation": "IS_EXPLAINING",
+        "n": 2
+      },
+      {
+        "canonical_relation": "ASKS",
+        "relation": "IS_QUESTIONING",
+        "n": 2
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "IS_GESTURING_TO",
+        "n": 2
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "EMOTIONAL_SHIFT",
+        "n": 2
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "relation": "PLACES_HAND_ON",
+        "n": 2
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "IS_POSITIONED_IN_FRONT_OF",
+        "n": 1
+      },
+      {
+        "canonical_relation": "LOOKS_AT",
+        "relation": "LOOKS_AT",
+        "n": 1
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "SMILES_AT",
+        "n": 1
+      },
+      {
+        "canonical_relation": "REACTS_TO",
+        "relation": "IS_LAUGHING_AND_GESTURING_IN_RESPONSE_TO",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_THE_FOCUS_OF",
+        "n": 1
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "RAISES",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_PRESENTING",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "IS_STANDING_APART_FROM",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IN_LOCATION",
+        "relation": "SAME_LOCATION",
+        "n": 1
+      },
+      {
+        "canonical_relation": "ASKS",
+        "relation": "QUESTIONS",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IGNORES",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "IS_STANDING_BETWEEN",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "IS_STANDING_BESIDE",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IS_SEATED_NEAR",
+        "relation": "IS_SITTING_IN_FRONT_OF",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_PERSUADING",
+        "n": 1
+      },
+      {
+        "canonical_relation": "IS_POSITIONED_NEAR",
+        "relation": "STANDS_APART_FROM",
+        "n": 1
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "IS_LAUGHING_AT",
+        "n": 1
+      },
+      {
+        "canonical_relation": "HAS_EMOTION",
+        "relation": "IS_DEMANDING",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "MEDIATES_BETWEEN",
+        "n": 1
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "IS_GESTURING_WHILE",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "THREATENS",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IS_RECEIVING_FROM",
+        "n": 1
+      },
+      {
+        "canonical_relation": "OTHER",
+        "relation": "IGNITES",
+        "n": 1
+      },
+      {
+        "canonical_relation": "CRITICIZES",
+        "relation": "ACCUSES",
+        "n": 1
+      },
+      {
+        "canonical_relation": "HOLDS",
+        "relation": "HAS_HAND_ON",
+        "n": 1
+      },
+      {
+        "canonical_relation": "GESTURES_TOWARD",
+        "relation": "GESTURES_TOWARD",
+        "n": 1
+      },
+      {
+        "canonical_relation": "REACTS_TO",
+        "relation": "LISTENS_TO",
+        "n": 1
+      }
+    ]
+  },
+  "pipeline_alerts": [
+    {
+      "id": "c112debe-17fc-4b29-b0f1-f9e02038a8d1",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "level": 4,
+      "alert_type": "l4_canonical_relation_other_rate",
+      "value": 0.23943661971830985,
+      "threshold": 0.05,
+      "created_at": "2026-07-29T16:13:32.165584+00:00"
+    },
+    {
+      "id": "7b8a748e-8118-43a5-8cef-b3a04e5a05dd",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "level": 4,
+      "alert_type": "l4_canonical_relation_other_rate",
+      "value": 0.15492957746478872,
+      "threshold": 0.05,
+      "created_at": "2026-07-29T16:29:00.877270+00:00"
+    },
+    {
+      "id": "07efe44c-08b1-46cc-9ede-72642e04299a",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "level": 4,
+      "alert_type": "l4_canonical_relation_other_rate",
+      "value": 0.19718309859154928,
+      "threshold": 0.05,
+      "created_at": "2026-07-29T16:42:22.096740+00:00"
+    },
+    {
+      "id": "e7f82e6c-390e-452d-9a1f-a6a3011b8aef",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "level": 4,
+      "alert_type": "l4_canonical_relation_other_rate",
+      "value": 0.29577464788732394,
+      "threshold": 0.05,
+      "created_at": "2026-07-29T16:50:31.199270+00:00"
+    },
+    {
+      "id": "9738059f-66a9-4c5b-9d92-f476d194fc40",
+      "video_id": "97199656-d176-46aa-88b4-026670be4576",
+      "level": 4,
+      "alert_type": "l4_canonical_relation_other_rate",
+      "value": 0.19718309859154928,
+      "threshold": 0.05,
+      "created_at": "2026-07-30T05:15:10.439711+00:00"
+    }
+  ],
+  "correction_events": []
+}
